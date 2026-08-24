@@ -2,7 +2,12 @@
 
 > 榨取/剥削你的 coding plan 额度 —— ChatGPT Plus / OpenCode Go 用量浮窗
 
-单文件 WinForms 常驻浮窗，不用打开网页即可查看订阅用量。UI 风格致敬 [DeepSeekTimeline](https://github.com/Jerry2262/DeepSeekTimeline)。
+单文件 WinForms 常驻浮窗，不用打开网页即可查看订阅用量。
+
+## 参考项目
+
+- [DeepSeekTimeline](https://github.com/Jerry2262/DeepSeekTimeline) — 版式/交互模板：无边框自绘、顶部吸附 + 缓出动画、双击 Pin、浅色配色均出自它
+- [openusage (macOS)](https://github.com/robinebers/openusage) — 数据实现参考：Codex OAuth 凭据刷新、OpenCode Go 官方端点 `zen/go/v1/usage` 的取数与错误分类逻辑
 
 ## 功能
 
