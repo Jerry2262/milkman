@@ -422,22 +422,22 @@ namespace Milkman
   // =======================================================================
   class MilkmanForm : Form
   {
-    // 浅色系（参照 DeepSeekTimeline）
+    // 奶白暖色系（Milkman 主题: 牛奶/奶牛, 参照 DeepSeekTimeline 的浅色基调）
     const int W = 520; // DeepSeek 同宽
-    static readonly Color Bg = Color.FromArgb(247, 247, 248);
-    static readonly Color TextMain = Color.FromArgb(40, 40, 46);
-    static readonly Color TextSub = Color.FromArgb(110, 112, 119);
-    static readonly Color TextFaint = Color.FromArgb(154, 156, 163);
-    static readonly Color Accent = Color.FromArgb(198, 111, 100);
-    static readonly Color TrackCol = Color.FromArgb(226, 226, 231);
+    static readonly Color Bg = Color.FromArgb(251, 248, 242);        // 奶白背景
+    static readonly Color TextMain = Color.FromArgb(40, 38, 34);     // 暖墨
+    static readonly Color TextSub = Color.FromArgb(116, 110, 100);   // 暖灰
+    static readonly Color TextFaint = Color.FromArgb(158, 151, 139); // 淡暖灰
+    static readonly Color Accent = Color.FromArgb(198, 111, 100);    // 暖红(保留)
+    static readonly Color TrackCol = Color.FromArgb(235, 228, 216);  // 暖浅轨道
     static readonly Color BarGreen = Color.FromArgb(46, 204, 113);
     static readonly Color BarYellow = Color.FromArgb(241, 196, 15);
     static readonly Color BarRed = Color.FromArgb(231, 76, 60);
     static readonly SolidBrush BrText, BrSub, BrFaint, BrAccent, BrTrack, BrGreen, BrYellow, BrRed;
     static readonly Pen PenCloseDim = new Pen(Color.FromArgb(165, 167, 173), 1.6f);
     static readonly Pen PenCloseHot = new Pen(Color.FromArgb(210, 96, 86), 1.6f);
-    static readonly Pen PenBorder = new Pen(Color.FromArgb(224, 224, 229));
-    static readonly Pen PenBarBorder = new Pen(Color.FromArgb(208, 208, 216));
+    static readonly Pen PenBorder = new Pen(Color.FromArgb(232, 224, 210));
+    static readonly Pen PenBarBorder = new Pen(Color.FromArgb(212, 202, 186));
     static readonly Dictionary<string, float> MeasureCache = new Dictionary<string, float>();
 
     static MilkmanForm()
