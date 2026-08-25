@@ -27,7 +27,7 @@ namespace Milkman
       NativeMethods.SetProcessDPIAware();
       Application.EnableVisualStyles();
       Application.SetCompatibleTextRenderingDefault(false);
-      AutoStart.Set(true); // 个人工具固定开机自启；每次启动同时刷新注册表中的 exe 路径
+      AutoStart.Ensure(); // 固定开机自启；每次启动同时刷新注册表中的 exe 路径
       Application.Run(new MilkmanForm());
     }
 
@@ -88,24 +88,17 @@ namespace Milkman
 
     public static Config Load()
     {
-      var cfg = new Config();
       try
       {
         var path = Path.Combine(Program.DataDir(), "config.json");
-        if (File.Exists(path))
-        {
-          var d = new JavaScriptSerializer().DeserializeObject(File.ReadAllText(path)) as Dictionary<string, object>;
-          if (d == null) return cfg;
-          cfg.X = GetInt(d, "X", -1);
-          cfg.Y = GetInt(d, "Y", -1);
-          cfg.Docked = GetBool(d, "Docked", false);
-          cfg.RefreshSeconds = GetInt(d, "RefreshSeconds", 60);
-          List<OpenCodeAccountConfig> accounts;
-          if (TryGetAccounts(d, out accounts)) cfg.OpenCodeAccounts = accounts;
-        }
+        if (!File.Exists(path)) return new Config();
+        var cfg = new JavaScriptSerializer().Deserialize<Config>(File.ReadAllText(path));
+        if (cfg == null) return new Config();
+        if (cfg.OpenCodeAccounts == null) cfg.OpenCodeAccounts = new List<OpenCodeAccountConfig>();
+        return cfg;
       }
       catch { }
-      return cfg;
+      return new Config();
     }
 
     public void Save()
@@ -113,62 +106,10 @@ namespace Milkman
       try
       {
         Directory.CreateDirectory(Program.DataDir());
-        var accounts = new List<Dictionary<string, object>>();
-        foreach (var account in OpenCodeAccounts)
-        {
-          accounts.Add(new Dictionary<string, object>
-          {
-            { "Name", account.Name ?? "" },
-            { "AuthPath", account.AuthPath ?? "" }
-          });
-        }
-        var d = new Dictionary<string, object>
-        {
-          { "X", X }, { "Y", Y }, { "Docked", Docked },
-          { "RefreshSeconds", RefreshSeconds },
-          { "OpenCodeAccounts", accounts }
-        };
         File.WriteAllText(Path.Combine(Program.DataDir(), "config.json"),
-          new JavaScriptSerializer().Serialize(d), new UTF8Encoding(false));
+          new JavaScriptSerializer().Serialize(this), new UTF8Encoding(false));
       }
       catch { }
-    }
-
-    static int GetInt(Dictionary<string, object> d, string k, int def)
-    {
-      object v;
-      return d.TryGetValue(k, out v) && v != null ? Convert.ToInt32(v) : def;
-    }
-    static bool GetBool(Dictionary<string, object> d, string k, bool def)
-    {
-      object v;
-      if (!d.TryGetValue(k, out v) || v == null) return def;
-      return Convert.ToBoolean(v);
-    }
-    static string GetStr(Dictionary<string, object> d, string k, string def)
-    {
-      object v;
-      return d.TryGetValue(k, out v) && v != null ? Convert.ToString(v) : def;
-    }
-
-    static bool TryGetAccounts(Dictionary<string, object> d, out List<OpenCodeAccountConfig> accounts)
-    {
-      accounts = new List<OpenCodeAccountConfig>();
-      object raw;
-      if (!d.TryGetValue("OpenCodeAccounts", out raw)) return false;
-      var items = raw as object[];
-      if (items == null) return false;
-      foreach (object item in items)
-      {
-        var a = item as Dictionary<string, object>;
-        if (a == null) continue;
-        accounts.Add(new OpenCodeAccountConfig
-        {
-          Name = GetStr(a, "Name", ""),
-          AuthPath = GetStr(a, "AuthPath", "")
-        });
-      }
-      return true;
     }
 
     static List<OpenCodeAccountConfig> DefaultOpenCodeAccounts()
@@ -196,7 +137,6 @@ namespace Milkman
   class GptFetchResult
   {
     public List<UsageWindow> Windows = new List<UsageWindow>();
-    public string PlanType;
     public string Error;
     public DateTime LastSuccess;
   }
@@ -204,19 +144,9 @@ namespace Milkman
   class GoAccountSnapshot
   {
     public string Name;
-    public UsageWindow Session, Week, Month;
+    public UsageWindow[] Windows = new UsageWindow[3]; // 5h / 周 / 月
     public string Error;
     public DateTime LastSuccess;
-  }
-
-  class Snapshot
-  {
-    public List<UsageWindow> GptWindows = new List<UsageWindow>();
-    public string GptPlanType;
-    public string GptError;
-    public DateTime GptLastSuccess;
-    public List<GoAccountSnapshot> GoAccounts = new List<GoAccountSnapshot>();
-    public string GoError;
   }
 
   // =======================================================================
@@ -254,15 +184,30 @@ namespace Milkman
 
     static string Serialize(object value) { lock (JsLock) return Js.Serialize(value); }
 
+    static object Value(Dictionary<string, object> d, string key)
+    {
+      object value;
+      return d != null && d.TryGetValue(key, out value) ? value : null;
+    }
+
+    static Dictionary<string, object> Map(Dictionary<string, object> d, string key)
+    {
+      return Value(d, key) as Dictionary<string, object>;
+    }
+
+    static string Text(Dictionary<string, object> d, string key)
+    {
+      return Convert.ToString(Value(d, key) ?? "");
+    }
+
     // ---------------- ChatGPT ----------------
     void FetchGptCore(GptFetchResult result)
     {
       string authPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".codex", "auth.json");
-      string access, refreshToken;
       var dict = Deserialize(File.ReadAllText(authPath)) as Dictionary<string, object>;
-      var tokens = dict != null ? dict["tokens"] as Dictionary<string, object> : null;
-      access = tokens != null ? Convert.ToString(tokens["access_token"]) : "";
-      refreshToken = tokens != null ? Convert.ToString(tokens["refresh_token"]) : "";
+      var tokens = Map(dict, "tokens");
+      string access = Text(tokens, "access_token");
+      string refreshToken = Text(tokens, "refresh_token");
       if (string.IsNullOrEmpty(access))
         throw new Exception("codex auth.json 无 access_token");
 
@@ -290,9 +235,9 @@ namespace Milkman
       var resp = HttpPostForm(TokenUrl, body);
       var d = Deserialize(resp) as Dictionary<string, object>;
       // mac 版参考: 刷新可能返回 refresh_token_expired / reused / invalidated 等错误码
-      if (d != null && d["error"] != null)
-        throw new Exception("token 刷新失败: " + Convert.ToString(d["error"]));
-      var at = d != null ? Convert.ToString(d["access_token"]) : "";
+      string error = Text(d, "error");
+      if (error.Length > 0) throw new Exception("token 刷新失败: " + error);
+      string at = Text(d, "access_token");
       if (string.IsNullOrEmpty(at)) throw new Exception("token 刷新失败");
       return at;
     }
@@ -301,9 +246,8 @@ namespace Milkman
     {
       var d = Deserialize(resp) as Dictionary<string, object>;
       if (d == null) throw new Exception("wham 响应无法解析");
-      result.PlanType = Convert.ToString(d["plan_type"] ?? "");
 
-      var rl = d["rate_limit"] as Dictionary<string, object>;
+      var rl = Map(d, "rate_limit");
       if (rl != null)
       {
         // 实际响应里 primary/secondary 的秒数因账号而异（plus 当前=604800 周窗口），标签按秒数动态生成
@@ -311,13 +255,13 @@ namespace Milkman
         AddWindow(result, rl, "secondary_window", null);
       }
       // code_review_rate_limit 是独立周限，可选展示
-      var crl = d["code_review_rate_limit"] as Dictionary<string, object>;
+      var crl = Map(d, "code_review_rate_limit");
       if (crl != null) AddWindowFromDict(result, crl, "代码审查");
     }
 
     void AddWindow(GptFetchResult result, Dictionary<string, object> rl, string key, string label)
     {
-      AddWindowFromDict(result, rl[key] as Dictionary<string, object>, label);
+      AddWindowFromDict(result, Map(rl, key), label);
     }
 
     void AddWindowFromDict(GptFetchResult result, Dictionary<string, object> w, string label)
@@ -327,20 +271,22 @@ namespace Milkman
       // 无显式 label 时按窗口秒数生成（18000→5h, 604800 或其他周四→周, 其余按天/小时）
       if (label == null)
       {
-        long sec = w["limit_window_seconds"] != null ? Convert.ToInt64(w["limit_window_seconds"]) : 0;
+        object seconds = Value(w, "limit_window_seconds");
+        long sec = seconds != null ? Convert.ToInt64(seconds) : 0;
         if (sec == 18000) label = "5h";
         else if (sec == 604800) label = "周";
-        else if (sec >= 86400 && sec % 86400 == 0) label = "N 天";
+        else if (sec >= 86400 && sec % 86400 == 0) label = sec / 86400 + "天";
         else if (sec >= 3600 && sec % 3600 == 0) label = sec / 3600 + "h";
         else label = (sec / 3600.0).ToString("F1") + "h";
       }
       win.Label = label;
-      win.UsedPct = Convert.ToDouble(w["used_percent"] ?? 0) / 100.0;
+      object used = Value(w, "used_percent");
+      win.UsedPct = (used != null ? Convert.ToDouble(used) : 0) / 100.0;
       double resetMs = 0;
-      if (w["reset_at"] != null) resetMs = Convert.ToDouble(w["reset_at"]) * 1000;
-      else if (w["resets_at_time"] != null) resetMs = Convert.ToDouble(w["resets_at_time"]) * 1000;
-      else if (w["reset_after_seconds"] != null)
-        resetMs = Program.NowUnixMs() + Convert.ToDouble(w["reset_after_seconds"]) * 1000;
+      object reset = Value(w, "reset_at") ?? Value(w, "resets_at_time");
+      object after = Value(w, "reset_after_seconds");
+      if (reset != null) resetMs = Convert.ToDouble(reset) * 1000;
+      else if (after != null) resetMs = Program.NowUnixMs() + Convert.ToDouble(after) * 1000;
       win.ResetMs = resetMs;
       result.Windows.Add(win);
     }
@@ -367,9 +313,8 @@ namespace Milkman
       if (string.IsNullOrEmpty(authPath) || !File.Exists(authPath))
         throw new Exception("未找到 opencode auth.json");
       var d = Deserialize(File.ReadAllText(authPath)) as Dictionary<string, object>;
-      var goe = d != null ? d["opencode-go"] as Dictionary<string, object> : null;
-      string key = goe != null ? Convert.ToString(goe["key"] ?? "") : "";
-      key = key.Trim();
+      var goe = Map(d, "opencode-go");
+      string key = Text(goe, "key").Trim();
       if (key.Length == 0) throw new Exception("未登录 OpenCode Go");
 
       string body; int status;
@@ -378,20 +323,21 @@ namespace Milkman
       if (status == 403) throw new Exception("该 key 无 Go 订阅");
       if (status < 200 || status >= 300) throw new Exception("Go usage HTTP " + status);
       var u = Deserialize(body) as Dictionary<string, object>;
-      var usage = u != null ? u["usage"] as Dictionary<string, object> : null;
+      var usage = Map(u, "usage");
       if (usage == null) throw new Exception("Go usage 响应无法解析");
-      account.Session = ParseGoWindow(usage, "rolling", "5h");
-      account.Week = ParseGoWindow(usage, "weekly", "周");
-      account.Month = ParseGoWindow(usage, "monthly", "月");
+      account.Windows[0] = ParseGoWindow(usage, "rolling", "5h");
+      account.Windows[1] = ParseGoWindow(usage, "weekly", "周");
+      account.Windows[2] = ParseGoWindow(usage, "monthly", "月");
     }
 
     UsageWindow ParseGoWindow(Dictionary<string, object> usage, string key, string label)
     {
-      var w = usage[key] as Dictionary<string, object>;
+      var w = Map(usage, key);
       if (w == null) return null;
-      if (w["percent"] == null) throw new Exception("Go " + key + " 无 percent");
-      var g = new UsageWindow { Label = label, UsedPct = Convert.ToDouble(w["percent"]) / 100.0, ResetMs = 0 };
-      string resetsAt = Convert.ToString(w["resetsAt"] ?? "");
+      object percent = Value(w, "percent");
+      if (percent == null) throw new Exception("Go " + key + " 无 percent");
+      var g = new UsageWindow { Label = label, UsedPct = Convert.ToDouble(percent) / 100.0, ResetMs = 0 };
+      string resetsAt = Text(w, "resetsAt");
       DateTimeOffset t;
       if (DateTimeOffset.TryParse(resetsAt, out t))
         g.ResetMs = (long)((t.UtcDateTime - new DateTime(1970, 1, 1)).TotalMilliseconds);
@@ -470,15 +416,12 @@ namespace Milkman
     const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
     const string Name = "Milkman";
 
-    public static void Set(bool on)
+    public static void Ensure()
     {
       try
       {
         using (var k = Registry.CurrentUser.CreateSubKey(RunKey))
-        {
-          if (on) k.SetValue(Name, "\"" + Application.ExecutablePath + "\"");
-          else k.DeleteValue(Name, false);
-        }
+          k.SetValue(Name, "\"" + Application.ExecutablePath + "\"");
       }
       catch { }
     }
@@ -505,7 +448,6 @@ namespace Milkman
     static readonly Pen PenCloseHot = new Pen(Color.FromArgb(210, 96, 86), 1.6f);
     static readonly Pen PenBorder = new Pen(Color.FromArgb(232, 224, 210));
     static readonly Pen PenBarBorder = new Pen(Color.FromArgb(212, 202, 186));
-    static readonly Dictionary<string, float> MeasureCache = new Dictionary<string, float>();
 
     static MilkmanForm()
     {
@@ -518,11 +460,12 @@ namespace Milkman
       BrYellow = new SolidBrush(BarYellow);
       BrRed = new SolidBrush(BarRed);
       BrAccentOff = new SolidBrush(AccentOff);
-      BandPathGpt = RoundedRect(new RectangleF(20, BandTop1, BoxW, BandH), 5f);
+      for (int count = 1; count <= 3; count++)
+        GptBandPaths[count - 1] = CreateBandPaths(BandTop1, count);
     }
 
     // 字体层次（参照 DeepSeekTimeline）
-    readonly Font fontBig, fontMid, fontSub, fontTick;
+    readonly Font fontBig, fontMid, fontTick;
     readonly Rectangle closeRect = new Rectangle(W - 26, 7, 15, 15);
     bool hoverClose;
 
@@ -540,36 +483,35 @@ namespace Milkman
 
     Config _cfg;
     DataFetcher _fetcher;
-    Snapshot _snap = new Snapshot();
+    GptFetchResult _gpt = new GptFetchResult();
+    List<GoAccountSnapshot> _goAccounts = new List<GoAccountSnapshot>();
+    string _goError;
     Timer _refreshTimer = new Timer();
     Timer _clockTimer = new Timer();
     bool _gptBusy, _gptAuto = true;
     bool[] _goBusy, _goAuto;
     int _formH;
     int _goRowCount;
-    GraphicsPath[,] _bandPathGo;
+    GraphicsPath[][] _goBandPaths;
 
     public MilkmanForm()
     {
       _cfg = Config.Load();
       _fetcher = new DataFetcher();
       foreach (var account in _cfg.OpenCodeAccounts)
-        _snap.GoAccounts.Add(new GoAccountSnapshot { Name = account.Name });
-      if (_cfg.OpenCodeAccounts.Count == 0) _snap.GoError = "未配置 OpenCode 账户";
+        _goAccounts.Add(new GoAccountSnapshot { Name = account.Name });
+      if (_cfg.OpenCodeAccounts.Count == 0) _goError = "未配置 OpenCode 账户";
       _goBusy = new bool[_cfg.OpenCodeAccounts.Count];
       _goAuto = new bool[_cfg.OpenCodeAccounts.Count];
       for (int i = 0; i < _goAuto.Length; i++) _goAuto[i] = true;
       _goRowCount = Math.Max(1, _cfg.OpenCodeAccounts.Count);
       _formH = 16 + (_goRowCount + 1) * GoRowH;
-      _bandPathGo = new GraphicsPath[_goRowCount, 3];
+      _goBandPaths = new GraphicsPath[_goRowCount][];
       for (int row = 0; row < _goRowCount; row++)
-        for (int i = 0; i < 3; i++)
-          _bandPathGo[row, i] = RoundedRect(new RectangleF(GoSegX[i],
-            GoFirstRowY + row * GoRowH + GoBandOffset, SegW, BandH), 5f);
+        _goBandPaths[row] = CreateBandPaths(GoFirstRowY + row * GoRowH + GoBandOffset, 3);
 
       fontBig = new Font("Microsoft YaHei UI", 12f, FontStyle.Bold);
       fontMid = new Font("Microsoft YaHei UI", 9f, FontStyle.Regular);
-      fontSub = new Font("Microsoft YaHei UI", 9f, FontStyle.Regular);
       fontTick = new Font("Microsoft YaHei UI", 7.5f, FontStyle.Regular);
       Font = fontMid;
 
@@ -663,14 +605,9 @@ namespace Milkman
       _gptBusy = false;
       _gptAuto = result.Error == null;
       if (result.Error == null)
-      {
-        _snap.GptWindows = result.Windows;
-        _snap.GptPlanType = result.PlanType;
-        _snap.GptLastSuccess = result.LastSuccess;
-        _snap.GptError = null;
-      }
+        _gpt = result;
       else
-        _snap.GptError = result.Error; // 保留上次成功数据，只更新错误状态
+        _gpt.Error = result.Error; // 保留上次成功数据，只更新错误状态
       Invalidate();
     }
 
@@ -689,15 +626,13 @@ namespace Milkman
 
     void ApplyGoResult(int index, GoAccountSnapshot result)
     {
-      if (index < 0 || index >= _snap.GoAccounts.Count) return;
+      if (index < 0 || index >= _goAccounts.Count) return;
       _goBusy[index] = false;
       _goAuto[index] = result.Error == null;
-      GoAccountSnapshot current = _snap.GoAccounts[index];
+      GoAccountSnapshot current = _goAccounts[index];
       if (result.Error == null)
       {
-        current.Session = result.Session;
-        current.Week = result.Week;
-        current.Month = result.Month;
+        current.Windows = result.Windows;
         current.LastSuccess = result.LastSuccess;
         current.Error = null;
       }
@@ -771,7 +706,15 @@ namespace Milkman
         if (docked)
         {
           pinned = !pinned;
-          if (pinned) { expanded = true; } // 钉住时保持展开以明确"正在使用"
+          if (pinned)
+          {
+            expanded = true;
+            NativeMethods.SetWindowPos(Handle, IntPtr.Zero, Left, monRect.Top, 0, 0,
+              0x0001 | 0x0004 | 0x0010); // 立即展开后停表，钉住期间不再空轮询
+            _dockTimer.Stop();
+          }
+          else
+            _dockTimer.Start();
           SaveState();
           Invalidate();
         }
@@ -876,28 +819,26 @@ namespace Milkman
     }
 
     // ---------------- 自绘 ----------------
-    // 文本宽度缓存：帧间相同字符串零测量开销（参照 DeepSeekTimeline）
-    float Wd(Graphics g, string s, Font f)
-    {
-      float w;
-      if (!MeasureCache.TryGetValue(s + "|" + f.Size + (f.Bold ? "b" : ""), out w))
-      {
-        w = g.MeasureString(s, f).Width;
-        MeasureCache[s + "|" + f.Size + (f.Bold ? "b" : "")] = w;
-      }
-      return w;
-    }
+    float Wd(Graphics g, string s, Font f) { return g.MeasureString(s, f).Width; }
 
     // 版式完全参照 DeepSeekTimeline: 顶部 provider 名, 中部圆角色带(独立圆角条/留间隙),
     // 每条下方 两行元信息: 百分比 + 重置时间
     const int BandH = 12, BandTop1 = 44;
     const int GoFirstRowY = 88, GoRowH = 76, GoBandOffset = 32;
-    const float BoxW = W - 40f, Gap = 6f, SegW = (BoxW - 2 * Gap) / 3f;
+    const float BoxW = W - 40f, Gap = 6f;
     static readonly Color AccentOff = Color.FromArgb(88, 143, 124);
     static readonly SolidBrush BrAccentOff;
-    // 用量条圆角轮廓(固定几何, 缓存复用): ChatGPT 整条一段; 每个 Go 账户三段
-    static readonly GraphicsPath BandPathGpt;
-    static readonly float[] GoSegX = new float[] { 20, 20 + SegW + Gap, 20 + 2 * (SegW + Gap) };
+    // ChatGPT 按实际窗口数选择 1/2/3 段；OpenCode 固定三段。路径只创建一次。
+    static readonly GraphicsPath[][] GptBandPaths = new GraphicsPath[3][];
+
+    static GraphicsPath[] CreateBandPaths(float y, int count)
+    {
+      float width = (BoxW - (count - 1) * Gap) / count;
+      var paths = new GraphicsPath[count];
+      for (int i = 0; i < count; i++)
+        paths[i] = RoundedRect(new RectangleF(20 + i * (width + Gap), y, width, BandH), 5f);
+      return paths;
+    }
 
     static GraphicsPath RoundedRect(RectangleF r, float rad)
     {
@@ -944,7 +885,7 @@ namespace Milkman
       if (!string.IsNullOrEmpty(status))
       {
         SolidBrush brush = error && !busy ? BrRed : busy ? BrSub : BrFaint;
-        g.DrawString(status, fontSub, brush, W - 20 - Wd(g, status, fontSub), rowY + 3);
+        g.DrawString(status, fontMid, brush, W - 20 - Wd(g, status, fontMid), rowY + 3);
       }
     }
 
@@ -970,6 +911,25 @@ namespace Milkman
         g.DrawString(right, fontTick, BrSub, x + w - Wd(g, right, fontTick), y + 2);
     }
 
+    void DrawWindows(Graphics g, IList<UsageWindow> windows, GraphicsPath[] paths, float bandY, string error)
+    {
+      int count = paths.Length;
+      float width = (BoxW - (count - 1) * Gap) / count;
+      for (int i = 0; i < count; i++)
+      {
+        float x = 20 + i * (width + Gap);
+        var window = windows != null && i < windows.Count ? windows[i] : null;
+        DrawBand(g, paths[i], x, bandY, width, window != null ? window.UsedPct : 0);
+        if (window != null)
+          DrawBandMeta(g, x, width, bandY + BandH + 6,
+            window.Label + " " + (int)(window.UsedPct * 100) + "%",
+            window.ResetMs > 0 ? "重置 " + FormatRemaining(window.ResetMs) : "");
+        else
+          g.DrawString(error != null ? "⚠ 无数据" : "—", fontTick, error != null ? BrRed : BrSub,
+            x, bandY + BandH + 8);
+      }
+    }
+
     protected override void OnPaint(PaintEventArgs e)
     {
       base.OnPaint(e);
@@ -978,50 +938,29 @@ namespace Milkman
       g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAlias;
       g.Clear(Bg);
 
-      // ---- 块1: ChatGPT Plus (单窗口 = 整条) ----
-      var w = _snap.GptWindows.Count > 0 ? _snap.GptWindows[0] : null;
+      // ---- 块1: ChatGPT Plus (按实际额度窗口数分段) ----
       DrawBlockHead(g, 12, BrAccent, "ChatGPT Plus",
-        SourceStatus(_gptBusy, _snap.GptError, _snap.GptLastSuccess), _snap.GptError != null, _gptBusy);
-      DrawBand(g, BandPathGpt, 20, BandTop1, BoxW, w != null ? w.UsedPct : 0);
-      // 条下一行: 左端百分比, 右端重置时间
-      if (w != null)
-      {
-        DrawBandMeta(g, 20, BoxW, BandTop1 + BandH + 6, w.Label + " " + (int)(w.UsedPct * 100) + "%",
-          w.ResetMs > 0 ? "重置 " + FormatRemaining(w.ResetMs) : "");
-      }
-      else
-        g.DrawString(_snap.GptError != null ? "⚠ " + _snap.GptError : "暂无数据", fontTick, BrRed, 20, BandTop1 + BandH + 6);
+        SourceStatus(_gptBusy, _gpt.Error, _gpt.LastSuccess), _gpt.Error != null, _gptBusy);
+      int gptCount = Math.Max(1, Math.Min(3, _gpt.Windows.Count));
+      DrawWindows(g, _gpt.Windows, GptBandPaths[gptCount - 1], BandTop1, _gpt.Error);
 
       // ---- 块2+: 每个 OpenCode Go 账户一行，每行 5h/周/月三窗口 ----
       for (int row = 0; row < _goRowCount; row++)
       {
         int rowY = GoFirstRowY + row * GoRowH;
         int bandY = rowY + GoBandOffset;
-        GoAccountSnapshot account = row < _snap.GoAccounts.Count ? _snap.GoAccounts[row] : null;
+        GoAccountSnapshot account = row < _goAccounts.Count ? _goAccounts[row] : null;
         string name = account != null ? account.Name
           : row < _cfg.OpenCodeAccounts.Count ? _cfg.OpenCodeAccounts[row].Name : "";
         string title = string.IsNullOrEmpty(name) ? "OpenCode Go" : "OpenCode Go · " + name;
-        bool hasError = account != null ? account.Error != null : _snap.GoError != null;
+        bool hasError = account != null ? account.Error != null : _goError != null;
         bool busy = row < _goBusy.Length && _goBusy[row];
         DateTime lastSuccess = account != null ? account.LastSuccess : default(DateTime);
-        string error = account != null ? account.Error : _snap.GoError;
+        string error = account != null ? account.Error : _goError;
         DrawBlockHead(g, rowY, BrAccentOff, title,
           SourceStatus(busy, error, lastSuccess), hasError, busy);
 
-        var goWindows = account == null
-          ? new UsageWindow[] { null, null, null }
-          : new UsageWindow[] { account.Session, account.Week, account.Month };
-        for (int i = 0; i < 3; i++)
-        {
-          var seg = goWindows[i];
-          DrawBand(g, _bandPathGo[row, i], GoSegX[i], bandY, SegW, seg != null ? seg.UsedPct : 0);
-          if (seg != null)
-            DrawBandMeta(g, GoSegX[i], SegW, bandY + BandH + 6, seg.Label + " " + (int)(seg.UsedPct * 100) + "%",
-              seg.ResetMs > 0 ? "重置 " + FormatRemaining(seg.ResetMs) : "");
-          else
-            g.DrawString(hasError ? "⚠ 无数据" : "—", fontTick, hasError ? BrRed : BrSub,
-              GoSegX[i], bandY + BandH + 6);
-        }
+        DrawWindows(g, account != null ? account.Windows : null, _goBandPaths[row], bandY, error);
       }
 
       // ---- 关闭按钮 ----

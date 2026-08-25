@@ -2,7 +2,7 @@
 
 > 榨取/剥削你的 coding plan 额度 —— ChatGPT Plus / OpenCode Go 用量浮窗
 
-单文件 WinForms 常驻浮窗，不用打开网页即可查看订阅用量。
+Windows 专用的单文件 WinForms 常驻浮窗，不用打开网页即可查看订阅用量。
 
 ## 参考项目
 
@@ -11,7 +11,7 @@
 
 ## 功能
 
-- **ChatGPT Plus**：周限额用量条 + 重置倒计时（含 5h/周等多窗口自适应）
+- **ChatGPT Plus**：按实际返回的 5h / 周 / 代码审查等窗口分段展示
 - **OpenCode Go**：支持多个账户同时展示；每个账户均有 5h / 周 / 月三窗口用量条
 - **账户级服务端数据**：OpenCode Go 用量来自官方账户计数，与其他设备/工具消费一致
 - 屏幕顶部吸附 + 缓出动画 + 双击 Pin（钉住）——同 DeepSeekTimeline 交互
@@ -64,6 +64,21 @@ build.bat          # 编译到 %LOCALAPPDATA%\Milkman\Milkman.exe
 - `OpenCodeAccounts`：账户列表；增加项目后，浮窗会为每个账户增加一行并同时取数
 - `Name`：浮窗中的账户名称
 - `AuthPath`：该账户的 opencode `auth.json` 路径
+
+## 临时停用
+
+退出程序并取消下次开机启动：
+
+```powershell
+Stop-Process -Name Milkman -ErrorAction SilentlyContinue
+Remove-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name Milkman -ErrorAction SilentlyContinue
+```
+
+需要恢复时手动启动一次，程序会重新登记开机自启：
+
+```powershell
+Start-Process "$env:LOCALAPPDATA\Milkman\Milkman.exe"
+```
 
 ## 免责声明
 
