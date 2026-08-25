@@ -27,7 +27,7 @@ namespace Milkman
       NativeMethods.SetProcessDPIAware();
       Application.EnableVisualStyles();
       Application.SetCompatibleTextRenderingDefault(false);
-      AutoStart.Set(Config.Load().AutoStart); // 开机自启（config.json 的 AutoStart=false 可关）
+      AutoStart.Set(true); // 个人工具固定开机自启；每次启动同时刷新注册表中的 exe 路径
       Application.Run(new MilkmanForm());
     }
 
@@ -73,13 +73,18 @@ namespace Milkman
   // =======================================================================
   // 配置缓存: %LOCALAPPDATA%\Milkman\config.json
   // =======================================================================
+  class OpenCodeAccountConfig
+  {
+    public string Name = "";
+    public string AuthPath = "";
+  }
+
   class Config
   {
     public int X = -1, Y = -1;
     public bool Docked = false;
-    public bool AutoStart = true;
     public int RefreshSeconds = 60;
-    public string OpenCodeAuthPath = ""; // 空 = 自动探测(Win 本地 -> WSL)
+    public List<OpenCodeAccountConfig> OpenCodeAccounts = DefaultOpenCodeAccounts();
 
     public static Config Load()
     {
@@ -94,9 +99,9 @@ namespace Milkman
           cfg.X = GetInt(d, "X", -1);
           cfg.Y = GetInt(d, "Y", -1);
           cfg.Docked = GetBool(d, "Docked", false);
-          cfg.AutoStart = GetBool(d, "AutoStart", true);
           cfg.RefreshSeconds = GetInt(d, "RefreshSeconds", 60);
-          cfg.OpenCodeAuthPath = GetStr(d, "OpenCodeAuthPath", "");
+          List<OpenCodeAccountConfig> accounts;
+          if (TryGetAccounts(d, out accounts)) cfg.OpenCodeAccounts = accounts;
         }
       }
       catch { }
@@ -108,10 +113,20 @@ namespace Milkman
       try
       {
         Directory.CreateDirectory(Program.DataDir());
+        var accounts = new List<Dictionary<string, object>>();
+        foreach (var account in OpenCodeAccounts)
+        {
+          accounts.Add(new Dictionary<string, object>
+          {
+            { "Name", account.Name ?? "" },
+            { "AuthPath", account.AuthPath ?? "" }
+          });
+        }
         var d = new Dictionary<string, object>
         {
           { "X", X }, { "Y", Y }, { "Docked", Docked },
-          { "RefreshSeconds", RefreshSeconds }
+          { "RefreshSeconds", RefreshSeconds },
+          { "OpenCodeAccounts", accounts }
         };
         File.WriteAllText(Path.Combine(Program.DataDir(), "config.json"),
           new JavaScriptSerializer().Serialize(d), new UTF8Encoding(false));
@@ -135,6 +150,42 @@ namespace Milkman
       object v;
       return d.TryGetValue(k, out v) && v != null ? Convert.ToString(v) : def;
     }
+
+    static bool TryGetAccounts(Dictionary<string, object> d, out List<OpenCodeAccountConfig> accounts)
+    {
+      accounts = new List<OpenCodeAccountConfig>();
+      object raw;
+      if (!d.TryGetValue("OpenCodeAccounts", out raw)) return false;
+      var items = raw as object[];
+      if (items == null) return false;
+      foreach (object item in items)
+      {
+        var a = item as Dictionary<string, object>;
+        if (a == null) continue;
+        accounts.Add(new OpenCodeAccountConfig
+        {
+          Name = GetStr(a, "Name", ""),
+          AuthPath = GetStr(a, "AuthPath", "")
+        });
+      }
+      return true;
+    }
+
+    static List<OpenCodeAccountConfig> DefaultOpenCodeAccounts()
+    {
+      string local = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+        ".local", "share", "opencode", "auth.json");
+      string wsl = Path.Combine(@"\\wsl.localhost\Ubuntu-24.04", "home", "jerry",
+        ".local", "share", "opencode", "auth.json");
+      return new List<OpenCodeAccountConfig>
+      {
+        new OpenCodeAccountConfig
+        {
+          Name = "个人",
+          AuthPath = File.Exists(local) ? local : wsl
+        }
+      };
+    }
   }
 
   // =======================================================================
@@ -142,25 +193,37 @@ namespace Milkman
   // =======================================================================
   class UsageWindow { public string Label; public double UsedPct; public double ResetMs; }
 
+  class GptFetchResult
+  {
+    public List<UsageWindow> Windows = new List<UsageWindow>();
+    public string PlanType;
+    public string Error;
+    public DateTime LastSuccess;
+  }
+
+  class GoAccountSnapshot
+  {
+    public string Name;
+    public UsageWindow Session, Week, Month;
+    public string Error;
+    public DateTime LastSuccess;
+  }
+
   class Snapshot
   {
     public List<UsageWindow> GptWindows = new List<UsageWindow>();
     public string GptPlanType;
     public string GptError;
-    public UsageWindow GoSession, GoWeek, GoMonth;
+    public DateTime GptLastSuccess;
+    public List<GoAccountSnapshot> GoAccounts = new List<GoAccountSnapshot>();
     public string GoError;
-    public DateTime LastSuccess;
   }
 
   // =======================================================================
-  // DataFetcher: 拉取两个数据源（每次全量刷新，失败各自灰显不相互影响）
+  // DataFetcher: 无状态取数；ChatGPT 与每个 OpenCode 账户可并行调用
   // =======================================================================
   class DataFetcher
   {
-    Config _cfg;
-    public Snapshot Snap = new Snapshot();
-    public event EventHandler Updated;
-
     const string WhamUrl = "https://chatgpt.com/backend-api/wham/usage";
     const string TokenUrl = "https://auth.openai.com/oauth/token";
     const string CodexClientId = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -168,30 +231,35 @@ namespace Milkman
     // Cloudflare 1010: opencode.ai 按浏览器签名拦截, 需浏览器 UA
     const string BrowserUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
     static readonly JavaScriptSerializer Js = new JavaScriptSerializer();
+    static readonly object JsLock = new object();
 
-    public DataFetcher(Config cfg) { _cfg = cfg; }
-
-    public void Refresh()
+    public GptFetchResult FetchGpt()
     {
-      var snap = new Snapshot();
-      try { FetchGpt(snap); } catch (Exception e) { snap.GptError = Short(e.Message); }
-      try { FetchGo(snap); } catch (Exception e) { snap.GoError = Short(e.Message); }
-      if (snap.GptWindows.Count > 0 || snap.GptPlanType != null || snap.GoMonth != null)
-        snap.LastSuccess = DateTime.Now;
-      else
-        snap.LastSuccess = Snap.LastSuccess; // 保留上次成功时间
-      Snap = snap;
-      var h = Updated; if (h != null) h(this, EventArgs.Empty);
+      var result = new GptFetchResult();
+      try
+      {
+        FetchGptCore(result);
+        result.LastSuccess = DateTime.Now;
+      }
+      catch (Exception e) { result.Error = Short(e.Message); }
+      return result;
     }
 
     static string Short(string s) { return s.Length > 80 ? s.Substring(0, 80) + "…" : s; }
 
+    static object Deserialize(string json)
+    {
+      lock (JsLock) return Js.DeserializeObject(json);
+    }
+
+    static string Serialize(object value) { lock (JsLock) return Js.Serialize(value); }
+
     // ---------------- ChatGPT ----------------
-    void FetchGpt(Snapshot snap)
+    void FetchGptCore(GptFetchResult result)
     {
       string authPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".codex", "auth.json");
       string access, refreshToken;
-      var dict = Js.DeserializeObject(File.ReadAllText(authPath)) as Dictionary<string, object>;
+      var dict = Deserialize(File.ReadAllText(authPath)) as Dictionary<string, object>;
       var tokens = dict != null ? dict["tokens"] as Dictionary<string, object> : null;
       access = tokens != null ? Convert.ToString(tokens["access_token"]) : "";
       refreshToken = tokens != null ? Convert.ToString(tokens["refresh_token"]) : "";
@@ -206,21 +274,21 @@ namespace Milkman
         {
           tokens["access_token"] = newAccess;
           dict["last_refresh"] = Program.NowUnixMs() / 1000;
-          File.WriteAllText(authPath, Js.Serialize(dict), new UTF8Encoding(false));
+          File.WriteAllText(authPath, Serialize(dict), new UTF8Encoding(false));
         }
         catch { /* 写回失败仅内存持有 */ }
         access = newAccess;
         resp = HttpGet(WhamUrl, access);
         if (resp == null) throw new Exception("wham/usage 刷新后仍拒绝");
       }
-      ParseWham(snap, resp);
+      ParseWham(result, resp);
     }
 
     string RefreshAccessToken(string refreshToken)
     {
       var body = "client_id=" + CodexClientId + "&grant_type=refresh_token&refresh_token=" + Uri.EscapeDataString(refreshToken);
       var resp = HttpPostForm(TokenUrl, body);
-      var d = Js.DeserializeObject(resp) as Dictionary<string, object>;
+      var d = Deserialize(resp) as Dictionary<string, object>;
       // mac 版参考: 刷新可能返回 refresh_token_expired / reused / invalidated 等错误码
       if (d != null && d["error"] != null)
         throw new Exception("token 刷新失败: " + Convert.ToString(d["error"]));
@@ -229,30 +297,30 @@ namespace Milkman
       return at;
     }
 
-    void ParseWham(Snapshot snap, string resp)
+    void ParseWham(GptFetchResult result, string resp)
     {
-      var d = Js.DeserializeObject(resp) as Dictionary<string, object>;
+      var d = Deserialize(resp) as Dictionary<string, object>;
       if (d == null) throw new Exception("wham 响应无法解析");
-      snap.GptPlanType = Convert.ToString(d["plan_type"] ?? "");
+      result.PlanType = Convert.ToString(d["plan_type"] ?? "");
 
       var rl = d["rate_limit"] as Dictionary<string, object>;
       if (rl != null)
       {
         // 实际响应里 primary/secondary 的秒数因账号而异（plus 当前=604800 周窗口），标签按秒数动态生成
-        AddWindow(snap, rl, "primary_window", null);
-        AddWindow(snap, rl, "secondary_window", null);
+        AddWindow(result, rl, "primary_window", null);
+        AddWindow(result, rl, "secondary_window", null);
       }
       // code_review_rate_limit 是独立周限，可选展示
       var crl = d["code_review_rate_limit"] as Dictionary<string, object>;
-      if (crl != null) AddWindowFromDict(snap, crl, "代码审查");
+      if (crl != null) AddWindowFromDict(result, crl, "代码审查");
     }
 
-    void AddWindow(Snapshot snap, Dictionary<string, object> rl, string key, string label)
+    void AddWindow(GptFetchResult result, Dictionary<string, object> rl, string key, string label)
     {
-      AddWindowFromDict(snap, rl[key] as Dictionary<string, object>, label);
+      AddWindowFromDict(result, rl[key] as Dictionary<string, object>, label);
     }
 
-    void AddWindowFromDict(Snapshot snap, Dictionary<string, object> w, string label)
+    void AddWindowFromDict(GptFetchResult result, Dictionary<string, object> w, string label)
     {
       if (w == null) return;
       var win = new UsageWindow();
@@ -274,34 +342,47 @@ namespace Milkman
       else if (w["reset_after_seconds"] != null)
         resetMs = Program.NowUnixMs() + Convert.ToDouble(w["reset_after_seconds"]) * 1000;
       win.ResetMs = resetMs;
-      snap.GptWindows.Add(win);
+      result.Windows.Add(win);
     }
 
     // ---------------- OpenCode Go (参照 macOS openusage 实现) ----------------
     // 官方端点: GET https://opencode.ai/zen/go/v1/usage, Bearer = auth.json 中 opencode-go.key
     // 返回 { usage: { rolling, weekly, monthly } }, 各含 percent(0-100) + resetsAt(ISO8601),
     // 账户级服务端计费(与官方 dashboard 一致, 其他机器/工具消费同样计入)
-    void FetchGo(Snapshot snap)
+    public GoAccountSnapshot FetchGo(OpenCodeAccountConfig cfg)
     {
-      string authPath = FindOpenCodeAuthPath();
-      if (authPath == null) { snap.GoError = "未找到 opencode auth.json"; return; }
-      var d = Js.DeserializeObject(File.ReadAllText(authPath)) as Dictionary<string, object>;
+      var account = new GoAccountSnapshot { Name = cfg.Name };
+      try
+      {
+        FetchGoCore(account, cfg);
+        account.LastSuccess = DateTime.Now;
+      }
+      catch (Exception e) { account.Error = Short(e.Message); }
+      return account;
+    }
+
+    void FetchGoCore(GoAccountSnapshot account, OpenCodeAccountConfig cfg)
+    {
+      string authPath = cfg.AuthPath;
+      if (string.IsNullOrEmpty(authPath) || !File.Exists(authPath))
+        throw new Exception("未找到 opencode auth.json");
+      var d = Deserialize(File.ReadAllText(authPath)) as Dictionary<string, object>;
       var goe = d != null ? d["opencode-go"] as Dictionary<string, object> : null;
       string key = goe != null ? Convert.ToString(goe["key"] ?? "") : "";
       key = key.Trim();
-      if (key.Length == 0) { snap.GoError = "未登录 OpenCode Go"; return; }
+      if (key.Length == 0) throw new Exception("未登录 OpenCode Go");
 
       string body; int status;
       HttpGetWithStatus(GoUsageUrl, key, out body, out status);
       if (status == 401) throw new Exception("Go key 被拒绝");
       if (status == 403) throw new Exception("该 key 无 Go 订阅");
       if (status < 200 || status >= 300) throw new Exception("Go usage HTTP " + status);
-      var u = Js.DeserializeObject(body) as Dictionary<string, object>;
+      var u = Deserialize(body) as Dictionary<string, object>;
       var usage = u != null ? u["usage"] as Dictionary<string, object> : null;
       if (usage == null) throw new Exception("Go usage 响应无法解析");
-      snap.GoSession = ParseGoWindow(usage, "rolling", "5h");
-      snap.GoWeek = ParseGoWindow(usage, "weekly", "周");
-      snap.GoMonth = ParseGoWindow(usage, "monthly", "月");
+      account.Session = ParseGoWindow(usage, "rolling", "5h");
+      account.Week = ParseGoWindow(usage, "weekly", "周");
+      account.Month = ParseGoWindow(usage, "monthly", "月");
     }
 
     UsageWindow ParseGoWindow(Dictionary<string, object> usage, string key, string label)
@@ -315,20 +396,6 @@ namespace Milkman
       if (DateTimeOffset.TryParse(resetsAt, out t))
         g.ResetMs = (long)((t.UtcDateTime - new DateTime(1970, 1, 1)).TotalMilliseconds);
       return g;
-    }
-
-    // auth.json 路径: 先 Windows 本地, 再尝试 WSL 侧固定路径; 均由 config.OpenCodeAuthPath 可覆盖
-    string FindOpenCodeAuthPath()
-    {
-      if (!string.IsNullOrEmpty(_cfg.OpenCodeAuthPath) && File.Exists(_cfg.OpenCodeAuthPath))
-        return _cfg.OpenCodeAuthPath;
-      string local = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-        ".local", "share", "opencode", "auth.json");
-      if (File.Exists(local)) return local;
-      string wsl = Path.Combine(@"\\wsl.localhost\Ubuntu-24.04", "home", "jerry",
-        ".local", "share", "opencode", "auth.json");
-      if (File.Exists(wsl)) return wsl;
-      return null;
     }
 
     // ---------------- HTTP ----------------
@@ -452,8 +519,6 @@ namespace Milkman
       BrRed = new SolidBrush(BarRed);
       BrAccentOff = new SolidBrush(AccentOff);
       BandPathGpt = RoundedRect(new RectangleF(20, BandTop1, BoxW, BandH), 5f);
-      for (int i = 0; i < 3; i++)
-        BandPathGo[i] = RoundedRect(new RectangleF(GoSegX[i], BandTop2, SegW, BandH), 5f);
     }
 
     // 字体层次（参照 DeepSeekTimeline）
@@ -465,7 +530,9 @@ namespace Milkman
     const int WM_NCHITTEST = 0x84, HTCLIENT = 1, HTCAPTION = 2;
     const int WM_ENTERSIZEMOVE = 0x231, WM_EXITSIZEMOVE = 0x232;
     const int WM_SYSCOMMAND = 0x112, SC_MAXIMIZE = 0xF030;
-    const int WM_NCLBUTTONDBLCLK = 0xA3;
+    const int WM_NCLBUTTONDBLCLK = 0xA3, WM_NCLBUTTONUP = 0xA2;
+    Point _dragStart;         // 系统拖动起点(区分"单击"与"拖动")
+    int _dragStartTicks;
     const int Peek = 4; // 吸附收起时顶部保留的提示条高度(px, 用户微调: 5px 偏粗/3px 偏细)
     bool docked, expanded, dragging, pinned; // pinned = 双击钉住, DockTick 不自动收放
     Rectangle monRect;
@@ -476,13 +543,29 @@ namespace Milkman
     Snapshot _snap = new Snapshot();
     Timer _refreshTimer = new Timer();
     Timer _clockTimer = new Timer();
-    bool _busy;
-    const int H = 160; // 双块 + 每条一体元信息(左百分比/右重置)
+    bool _gptBusy, _gptAuto = true;
+    bool[] _goBusy, _goAuto;
+    int _formH;
+    int _goRowCount;
+    GraphicsPath[,] _bandPathGo;
 
     public MilkmanForm()
     {
       _cfg = Config.Load();
-      _fetcher = new DataFetcher(_cfg);
+      _fetcher = new DataFetcher();
+      foreach (var account in _cfg.OpenCodeAccounts)
+        _snap.GoAccounts.Add(new GoAccountSnapshot { Name = account.Name });
+      if (_cfg.OpenCodeAccounts.Count == 0) _snap.GoError = "未配置 OpenCode 账户";
+      _goBusy = new bool[_cfg.OpenCodeAccounts.Count];
+      _goAuto = new bool[_cfg.OpenCodeAccounts.Count];
+      for (int i = 0; i < _goAuto.Length; i++) _goAuto[i] = true;
+      _goRowCount = Math.Max(1, _cfg.OpenCodeAccounts.Count);
+      _formH = 16 + (_goRowCount + 1) * GoRowH;
+      _bandPathGo = new GraphicsPath[_goRowCount, 3];
+      for (int row = 0; row < _goRowCount; row++)
+        for (int i = 0; i < 3; i++)
+          _bandPathGo[row, i] = RoundedRect(new RectangleF(GoSegX[i],
+            GoFirstRowY + row * GoRowH + GoBandOffset, SegW, BandH), 5f);
 
       fontBig = new Font("Microsoft YaHei UI", 12f, FontStyle.Bold);
       fontMid = new Font("Microsoft YaHei UI", 9f, FontStyle.Regular);
@@ -499,7 +582,7 @@ namespace Milkman
       Opacity = 0.80; // 与 DeepSeek 一致
       SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint
         | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
-      Size = new Size(W, H);
+      Size = new Size(W, _formH);
       // 参照 DeepSeek: 恢复吸附时先按 X clamp 到虚拟屏并设 y=0(屏内), 使 OnLoad 的 Screen.FromControl 能判对屏
       if (_cfg.Docked && _cfg.X >= 0)
       {
@@ -510,13 +593,19 @@ namespace Milkman
       else
         Location = (_cfg.X >= 0 && _cfg.Y >= 0)
           ? new Point(_cfg.X, _cfg.Y)
-          : new Point(Screen.PrimaryScreen.WorkingArea.Right - W - 10, Screen.PrimaryScreen.WorkingArea.Bottom - H - 40);
+          : new Point(Screen.PrimaryScreen.WorkingArea.Right - W - 10, Screen.PrimaryScreen.WorkingArea.Bottom - _formH - 40);
 
 
       MouseMove += OnMouseMoveHook;
       MouseLeave += OnMouseLeaveHook;
       MouseDown += OnMouseDownHook;
       Shown += OnShownHook;
+      Shown += (s, e) =>
+      {
+        RefreshAll(true); // 句柄创建后再启动并行取数，确保结果能回到 UI 线程
+        _refreshTimer.Start();
+        _clockTimer.Start();
+      };
       FormClosing += (s, e) => SaveState();
 
       _dockTimer = new Timer();
@@ -531,50 +620,90 @@ namespace Milkman
           docked = true;
           expanded = false;
           pinned = false;
-          Location = new Point(Location.X, monRect.Top - H + Peek);
+          Location = new Point(Location.X, monRect.Top - _formH + Peek);
           _dockTimer.Start();
         }
       };
 
       _refreshTimer.Interval = _cfg.RefreshSeconds * 1000;
-      _refreshTimer.Tick += (s, e) => RefreshAsync();
+      _refreshTimer.Tick += (s, e) => RefreshAll(false);
       _clockTimer.Interval = 5000; // 与 DeepSeek 一致: 5s 周期重绘剩余时间
       _clockTimer.Tick += (s, e) =>
       {
         // 完全收起时可见区只有 5px 静态边条, 跳过无效重绘
-        if (docked && !expanded && Top <= monRect.Top - H + Peek) return;
+        if (docked && !expanded && Top <= monRect.Top - _formH + Peek) return;
         Invalidate();
       };
 
-      _fetcher.Updated += (s, e) =>
-      {
-        try
-        {
-          BeginInvoke((Action)(() =>
-          {
-            _snap = _fetcher.Snap;
-            _busy = false;
-            // 防封号策略: 获取失败即停止自动刷新（用户需开代理后单击重试），成功则恢复
-            if (_snap.GptWindows.Count == 0 && _snap.GptError != null)
-              _refreshTimer.Stop();
-            else
-              _refreshTimer.Start();
-            Invalidate();
-          }));
-        }
-        catch { }
-      };
-
-      RefreshAsync();
-      _refreshTimer.Start();
-      _clockTimer.Start();
     }
 
-    void RefreshAsync()
+    // 单个低频调度器触发彼此独立的后台任务；失败只关闭对应来源的 auto 标记
+    void RefreshAll(bool manual)
     {
-      if (_busy) return;
-      _busy = true;
-      Task.Run(() => { try { _fetcher.Refresh(); } catch { _busy = false; } });
+      bool started = StartGptRefresh(manual);
+      for (int i = 0; i < _cfg.OpenCodeAccounts.Count; i++)
+        started = StartGoRefresh(i, manual) || started;
+      if (started) Invalidate();
+    }
+
+    bool StartGptRefresh(bool manual)
+    {
+      if (_gptBusy || (!manual && !_gptAuto)) return false;
+      _gptBusy = true;
+      Task.Run(() =>
+      {
+        var result = _fetcher.FetchGpt();
+        try { BeginInvoke((Action)(() => ApplyGptResult(result))); } catch { }
+      });
+      return true;
+    }
+
+    void ApplyGptResult(GptFetchResult result)
+    {
+      _gptBusy = false;
+      _gptAuto = result.Error == null;
+      if (result.Error == null)
+      {
+        _snap.GptWindows = result.Windows;
+        _snap.GptPlanType = result.PlanType;
+        _snap.GptLastSuccess = result.LastSuccess;
+        _snap.GptError = null;
+      }
+      else
+        _snap.GptError = result.Error; // 保留上次成功数据，只更新错误状态
+      Invalidate();
+    }
+
+    bool StartGoRefresh(int index, bool manual)
+    {
+      if (index < 0 || index >= _goBusy.Length || _goBusy[index] || (!manual && !_goAuto[index])) return false;
+      _goBusy[index] = true;
+      OpenCodeAccountConfig cfg = _cfg.OpenCodeAccounts[index];
+      Task.Run(() =>
+      {
+        var result = _fetcher.FetchGo(cfg);
+        try { BeginInvoke((Action)(() => ApplyGoResult(index, result))); } catch { }
+      });
+      return true;
+    }
+
+    void ApplyGoResult(int index, GoAccountSnapshot result)
+    {
+      if (index < 0 || index >= _snap.GoAccounts.Count) return;
+      _goBusy[index] = false;
+      _goAuto[index] = result.Error == null;
+      GoAccountSnapshot current = _snap.GoAccounts[index];
+      if (result.Error == null)
+      {
+        current.Session = result.Session;
+        current.Week = result.Week;
+        current.Month = result.Month;
+        current.LastSuccess = result.LastSuccess;
+        current.Error = null;
+      }
+      else
+        current.Error = result.Error; // 仅暂停本账户，其他账户继续刷新
+      Invalidate();
     }
 
     // ---------------- 系统级拖动 + 顶部吸附（参照 DeepSeekTimeline） ----------------
@@ -594,11 +723,20 @@ namespace Milkman
       if (m.Msg == WM_ENTERSIZEMOVE)
       {
         dragging = true;
+        _dragStart = Cursor.Position;
+        _dragStartTicks = Environment.TickCount;
+        base.WndProc(ref m);
+        return;
+      }
+      if (m.Msg == WM_NCLBUTTONUP)
+      {
+        TryClickRetry(); // 非客户区松开: 单击(未拖动)才触发重试
         base.WndProc(ref m);
         return;
       }
       if (m.Msg == WM_EXITSIZEMOVE)
       {
+        TryClickRetry(); // 兜底: 系统不发 NCLBUTTONUP 时由拖动结束判定
         // 拖拽结束: 判定 进入吸附 / 保持吸附 / 脱离吸附
         dragging = false;
         monRect = Screen.FromControl(this).Bounds;
@@ -652,7 +790,7 @@ namespace Milkman
     void OnMouseDownHook(object sender, MouseEventArgs e)
     {
       if (closeRect.Contains(e.Location)) { Close(); return; } // ✕ = 退出程序
-      RefreshAsync(); // 单击 = 手动刷新（失败暂停后靠它恢复）
+      RefreshAt(e.Location);
     }
 
     void OnMouseMoveHook(object sender, MouseEventArgs e)
@@ -689,7 +827,7 @@ namespace Milkman
       var cfg = Config.Load();
       cfg.X = Location.X;
       cfg.Y = Location.Y;
-            cfg.Docked = docked;
+      cfg.Docked = docked;
       cfg.Save();
     }
 
@@ -715,7 +853,7 @@ namespace Milkman
       {
         expanded = false; // 离开立即收起（与 DeepSeek 一致, 零延迟）
       }
-      int target = expanded ? monRect.Top : monRect.Top - H + Peek;
+      int target = expanded ? monRect.Top : monRect.Top - _formH + Peek;
       if (Top != target)
       {
         int dy = target - Top;
@@ -752,13 +890,13 @@ namespace Milkman
 
     // 版式完全参照 DeepSeekTimeline: 顶部 provider 名, 中部圆角色带(独立圆角条/留间隙),
     // 每条下方 两行元信息: 百分比 + 重置时间
-    const int BandH = 12, BandTop1 = 40, BandTop2 = 112;
+    const int BandH = 12, BandTop1 = 44;
+    const int GoFirstRowY = 88, GoRowH = 76, GoBandOffset = 32;
     const float BoxW = W - 40f, Gap = 6f, SegW = (BoxW - 2 * Gap) / 3f;
     static readonly Color AccentOff = Color.FromArgb(88, 143, 124);
     static readonly SolidBrush BrAccentOff;
-    // 用量条圆角轮廓(固定几何, 静态缓存): ChatGPT 整条一段; Go 三段各独立圆角
+    // 用量条圆角轮廓(固定几何, 缓存复用): ChatGPT 整条一段; 每个 Go 账户三段
     static readonly GraphicsPath BandPathGpt;
-    static readonly GraphicsPath[] BandPathGo = new GraphicsPath[3];
     static readonly float[] GoSegX = new float[] { 20, 20 + SegW + Gap, 20 + 2 * (SegW + Gap) };
 
     static GraphicsPath RoundedRect(RectangleF r, float rad)
@@ -772,13 +910,42 @@ namespace Milkman
       return p;
     }
 
-    // 区块头: 仅圆点 + provider 名; 出错时右侧红字
-    void DrawBlockHead(Graphics g, int rowY, SolidBrush dot, string s1, string s2Error, bool error)
+    // 单击(按下-松开 未拖动)只刷新所在的数据区块
+    void TryClickRetry()
+    {
+      long dur = Environment.TickCount - _dragStartTicks;
+      Point p = Cursor.Position;
+      bool click = dur >= 0 && dur < 400 &&
+        Math.Abs(p.X - _dragStart.X) < 8 && Math.Abs(p.Y - _dragStart.Y) < 8;
+      if (click) RefreshAt(PointToClient(p));
+    }
+
+    void RefreshAt(Point p)
+    {
+      bool started;
+      if (p.Y < GoFirstRowY)
+        started = StartGptRefresh(true);
+      else
+        started = StartGoRefresh((p.Y - GoFirstRowY) / GoRowH, true);
+      if (started) Invalidate();
+    }
+
+    string SourceStatus(bool busy, string error, DateTime lastSuccess)
+    {
+      if (busy) return error != null ? "正在重试…" : lastSuccess == default(DateTime) ? "正在获取…" : "正在刷新…";
+      if (error != null) return "无法获取信息 · 单击重试";
+      return lastSuccess == default(DateTime) ? "" : "更新于 " + lastSuccess.ToString("HH:mm:ss");
+    }
+
+    void DrawBlockHead(Graphics g, int rowY, SolidBrush dot, string title, string status, bool error, bool busy)
     {
       g.FillEllipse(dot, 22, rowY + 7, 9, 9);
-      g.DrawString(s1, fontBig, BrText, 40, rowY - 1);
-      if (error && s2Error != null)
-        g.DrawString(s2Error, fontSub, BrRed, W - 20 - Wd(g, s2Error, fontSub), rowY + 3);
+      g.DrawString(title, fontBig, BrText, 40, rowY - 1);
+      if (!string.IsNullOrEmpty(status))
+      {
+        SolidBrush brush = error && !busy ? BrRed : busy ? BrSub : BrFaint;
+        g.DrawString(status, fontSub, brush, W - 20 - Wd(g, status, fontSub), rowY + 3);
+      }
     }
 
     // 单条独立圆角用量条: 轨道浅灰 + 已用填充(状态色) + 淡边框
@@ -811,14 +978,10 @@ namespace Milkman
       g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAlias;
       g.Clear(Bg);
 
-      // ---- 更新时间: 右上角闲置区 (✕ 左侧右对齐, 顶部紧凑) ----
-      string pr = _snap.LastSuccess == default(DateTime) ? "" : "更新于 " + _snap.LastSuccess.ToString("HH:mm:ss");
-      if (pr.Length > 0)
-        g.DrawString(pr, fontTick, BrFaint, W - 28 - Wd(g, pr, fontTick), 15);
-
       // ---- 块1: ChatGPT Plus (单窗口 = 整条) ----
       var w = _snap.GptWindows.Count > 0 ? _snap.GptWindows[0] : null;
-      DrawBlockHead(g, 12, BrAccent, "ChatGPT Plus", "无法获取信息 · 单击重试", w == null && _snap.GptError != null);
+      DrawBlockHead(g, 12, BrAccent, "ChatGPT Plus",
+        SourceStatus(_gptBusy, _snap.GptError, _snap.GptLastSuccess), _snap.GptError != null, _gptBusy);
       DrawBand(g, BandPathGpt, 20, BandTop1, BoxW, w != null ? w.UsedPct : 0);
       // 条下一行: 左端百分比, 右端重置时间
       if (w != null)
@@ -829,18 +992,36 @@ namespace Milkman
       else
         g.DrawString(_snap.GptError != null ? "⚠ " + _snap.GptError : "暂无数据", fontTick, BrRed, 20, BandTop1 + BandH + 6);
 
-      // ---- 块2: OpenCode Go (三窗口 = 三条独立圆角条, 留间隙) ----
-      DrawBlockHead(g, 84, BrAccentOff, "OpenCode Go", "无法获取信息 · 单击重试", _snap.GoMonth == null && _snap.GoError != null);
-      var goWindows = new UsageWindow[] { _snap.GoSession, _snap.GoWeek, _snap.GoMonth };
-      for (int i = 0; i < 3; i++)
+      // ---- 块2+: 每个 OpenCode Go 账户一行，每行 5h/周/月三窗口 ----
+      for (int row = 0; row < _goRowCount; row++)
       {
-        var seg = goWindows[i];
-        DrawBand(g, BandPathGo[i], GoSegX[i], BandTop2, SegW, seg != null ? seg.UsedPct : 0);
-        if (seg != null)
-          DrawBandMeta(g, GoSegX[i], SegW, BandTop2 + BandH + 6, seg.Label + " " + (int)(seg.UsedPct * 100) + "%",
-            seg.ResetMs > 0 ? "重置 " + FormatRemaining(seg.ResetMs) : "");
-        else
-          g.DrawString(_snap.GoError != null ? "⚠ 无数据" : "—", fontTick, BrRed, GoSegX[i], BandTop2 + BandH + 6);
+        int rowY = GoFirstRowY + row * GoRowH;
+        int bandY = rowY + GoBandOffset;
+        GoAccountSnapshot account = row < _snap.GoAccounts.Count ? _snap.GoAccounts[row] : null;
+        string name = account != null ? account.Name
+          : row < _cfg.OpenCodeAccounts.Count ? _cfg.OpenCodeAccounts[row].Name : "";
+        string title = string.IsNullOrEmpty(name) ? "OpenCode Go" : "OpenCode Go · " + name;
+        bool hasError = account != null ? account.Error != null : _snap.GoError != null;
+        bool busy = row < _goBusy.Length && _goBusy[row];
+        DateTime lastSuccess = account != null ? account.LastSuccess : default(DateTime);
+        string error = account != null ? account.Error : _snap.GoError;
+        DrawBlockHead(g, rowY, BrAccentOff, title,
+          SourceStatus(busy, error, lastSuccess), hasError, busy);
+
+        var goWindows = account == null
+          ? new UsageWindow[] { null, null, null }
+          : new UsageWindow[] { account.Session, account.Week, account.Month };
+        for (int i = 0; i < 3; i++)
+        {
+          var seg = goWindows[i];
+          DrawBand(g, _bandPathGo[row, i], GoSegX[i], bandY, SegW, seg != null ? seg.UsedPct : 0);
+          if (seg != null)
+            DrawBandMeta(g, GoSegX[i], SegW, bandY + BandH + 6, seg.Label + " " + (int)(seg.UsedPct * 100) + "%",
+              seg.ResetMs > 0 ? "重置 " + FormatRemaining(seg.ResetMs) : "");
+          else
+            g.DrawString(hasError ? "⚠ 无数据" : "—", fontTick, hasError ? BrRed : BrSub,
+              GoSegX[i], bandY + BandH + 6);
+        }
       }
 
       // ---- 关闭按钮 ----

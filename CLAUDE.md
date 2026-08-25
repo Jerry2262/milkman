@@ -8,7 +8,7 @@ Milkman — 单文件 WinForms 浮窗，显示 ChatGPT Plus（Plus/Pro 订阅额
 
 数据源均为**官方/半官方 HTTP 端点**，无本地数据库依赖：
 - ChatGPT: `chatgpt.com/backend-api/wham/usage`（Bearer = `%USERPROFILE%\.codex\auth.json` 的 OAuth token；401 时经 `auth.openai.com/oauth/token` + client_id `app_EMoamEEZ73f0CkXaXp7hrann` 刷新并写回）
-- OpenCode Go: `opencode.ai/zen/go/v1/usage`（Bearer = `opencode-go.key`；auth.json 路径探测：Windows 的 `~/.local/share/opencode/auth.json` → WSL 的 `\\wsl.localhost\Ubuntu-24.04\home\jerry\.local\share\opencode\auth.json`）
+- OpenCode Go: `opencode.ai/zen/go/v1/usage`（Bearer = `opencode-go.key`；唯一配置模型为 `OpenCodeAccounts` 列表，每项包含显示名称和 auth.json 路径）
 
 ## 常用命令
 
@@ -29,12 +29,12 @@ powershell.exe -NoProfile -Command "Start-Process 'C:\Users\jerry\AppData\Local\
 ## 架构（单文件 Main.cs，按 region 组织）
 
 - `Program` — 入口；TLS1.2 显式设置（.NET 4.x 默认不协商，必踩坑）；写自启注册表；`DataDir()` = `%LOCALAPPDATA%\Milkman`
-- `Config` — `config.json`（窗口 X/Y、Docked、AutoStart、RefreshSeconds、OpenCodeAuthPath）
-- `DataFetcher` — 唯一的网络层；`Refresh()` 双源各自 try/catch（失败互不影响）；错误消息截断 80 字；`HttpGetWithStatus` 保留状态码+body 供错误分类（401=key 拒绝 / 403=无订阅）
+- `Config` — `config.json`（窗口 X/Y、Docked、RefreshSeconds、OpenCodeAccounts）；程序固定开机自启，不设配置开关
+- `DataFetcher` — 无状态网络层；`FetchGpt()` 与每个 `FetchGo(account)` 可并行调用，序列化器只在短临界区加锁；错误消息截断 80 字；`HttpGetWithStatus` 保留状态码+body 供错误分类（401=key 拒绝 / 403=无订阅）
 - `MilkmanForm` — 自绘 UI + 行为：
-  - 版式：520×160，浅色系（Bg #F7F7F8 等），静态缓存 Brush/Pen/BandPath/文本测量 `Wd()`；GDI 对象零帧间创建
+  - 版式：宽 520，单 OpenCode 账户时高 168，每增加一个账户高度增加 76；标题到进度条统一留 32px 偏移；静态/实例缓存 Brush、Pen、BandPath 和文本测量 `Wd()`
   - 吸附：`WM_NCHITTEST`→`HTCAPTION` 系统级拖动（无边框窗 MaximizeBox 拦不住双击最大化→拦截 `WM_SYSCOMMAND/SYSCOMMAND` 和 `WM_NCLBUTTONDBLCLK`）；`WM_ENTERSIZEMOVE/EXITSIZEMOVE` 判定出入吸附（Top≤monTop+8 吸附，>monTop+30 脱离）；`DockTick` 30ms 缓出（dy/3 步进，`Peek=4` 收起条）；`pinned` 双击钉住时 DockTick 冻结
-  - 防封号：获取失败（GptWindows 空且 GptError 非空）→ `_refreshTimer.Stop()`，单击浮窗重试恢复
+  - 独立刷新：一个低频 `_refreshTimer` 仅负责调度；ChatGPT 与各 Go 账户分别维护 busy/auto/error/last-success，失败只暂停自身并保留旧数据，单击对应区块单独重试
   - 多屏：`monRect` 可能为负坐标屏（副屏在顶部），坐标计算要考虑
 - `AutoStart` — HKCU Run 的 `Milkman` 键
 

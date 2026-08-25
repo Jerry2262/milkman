@@ -12,18 +12,18 @@
 ## 功能
 
 - **ChatGPT Plus**：周限额用量条 + 重置倒计时（含 5h/周等多窗口自适应）
-- **OpenCode Go**：5h / 周 / 月 三窗口独立用量条 + 各自百分比/重置时间
+- **OpenCode Go**：支持多个账户同时展示；每个账户均有 5h / 周 / 月三窗口用量条
 - **账户级服务端数据**：OpenCode Go 用量来自官方账户计数，与其他设备/工具消费一致
 - 屏幕顶部吸附 + 缓出动画 + 双击 Pin（钉住）——同 DeepSeekTimeline 交互
-- 开机自启（`config.json` 可关）；窗口位置/吸附状态持久化
-- 防封号：获取失败即停自动刷新，界面提示"无法获取信息 · 单击重试"，点击恢复
+- 固定开机自启；窗口位置/吸附状态持久化
+- 独立刷新：ChatGPT 与每个 OpenCode 账户互不等待；失败只暂停自身并保留上次数据，点击对应区块恢复
 
 ## 数据源（均为 HTTP，无本地数据库依赖）
 
 | 订阅 | 端点 | 凭据 |
 |---|---|---|
 | ChatGPT / Codex | `chatgpt.com/backend-api/wham/usage`（非官方） | `%USERPROFILE%\.codex\auth.json` 的 OAuth token，401 自动刷新 |
-| OpenCode Go | `opencode.ai/zen/go/v1/usage`（官方） | `auth.json` 中 `opencode-go.key`（自动探测 Win / WSL 路径，可配置覆盖） |
+| OpenCode Go | `opencode.ai/zen/go/v1/usage`（官方） | `OpenCodeAccounts` 中每个 `auth.json` 的 `opencode-go.key` |
 
 ## 编译与运行
 
@@ -46,12 +46,24 @@ build.bat          # 编译到 %LOCALAPPDATA%\Milkman\Milkman.exe
 `%LOCALAPPDATA%\Milkman\config.json`：
 
 ```json
-{ "X": 2224, "Y": -2160, "Docked": true, "AutoStart": true, "RefreshSeconds": 60, "OpenCodeAuthPath": "" }
+{
+  "X": 2224,
+  "Y": -2160,
+  "Docked": true,
+  "RefreshSeconds": 60,
+  "OpenCodeAccounts": [
+    {
+      "Name": "个人",
+      "AuthPath": "\\\\wsl.localhost\\Ubuntu-24.04\\home\\jerry\\.local\\share\\opencode\\auth.json"
+    }
+  ]
+}
 ```
 
-- `AutoStart`：开机自启（默认开）
 - `RefreshSeconds`：刷新间隔（默认 60s）
-- `OpenCodeAuthPath`：opencode auth.json 路径（留空自动探测）
+- `OpenCodeAccounts`：账户列表；增加项目后，浮窗会为每个账户增加一行并同时取数
+- `Name`：浮窗中的账户名称
+- `AuthPath`：该账户的 opencode `auth.json` 路径
 
 ## 免责声明
 
