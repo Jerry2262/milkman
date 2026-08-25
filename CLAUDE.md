@@ -42,6 +42,6 @@ powershell.exe -NoProfile -Command "Start-Process 'C:\Users\jerry\AppData\Local\
 
 1. **编译**：`/out` 不支持 UNC 路径（必须输出到 Windows 本地）；输出目录需先存在；从 bash 调 csc 时 UNC 源路径必须单引号包裹；只支持 C#5 语法（无 `?.`、字符串插值等）和 .NET4.x API（无 `ToUnixTimeSeconds`）
 2. **Cloudflare 1010**：`opencode.ai` 按浏览器签名拦截，`BrowserUA` 是必需项
-3. **wham/usage 响应坑**：`credits` 是对象（`{has_credits, balance}`）非数字；窗口标签按 `limit_window_seconds` 动态生成（plus 当前 primary=604800 秒即"周"）
+3. **wham/usage 响应坑**：`credits` 是对象（`{has_credits, balance}`）非数字；窗口标签按 `limit_window_seconds` 动态生成；服务端缺少 5h 时插入 `Unlimited` 占位并显示 `5h ∞`，真实 5h 恢复后自动替换
 4. **QA 闭环**：代码在 WSL 侧（UNC 供 csc 读取），运行/验收在 Windows 桌面（用户协作看浮窗截图）；改 UI 后让用户截图确认，切勿臆断视觉效果
 5. DeepSeekTimeline 的 `Main.cs`（`~/DeepSeekTimeline`）是版式/交互的做法参照，不是本仓库文件

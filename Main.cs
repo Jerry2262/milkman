@@ -132,7 +132,12 @@ namespace Milkman
   // =======================================================================
   // 数据模型
   // =======================================================================
-  class UsageWindow { public string Label; public double UsedPct; public double ResetMs; }
+  class UsageWindow
+  {
+    public string Label;
+    public double UsedPct, ResetMs;
+    public bool Unlimited;
+  }
 
   class GptFetchResult
   {
@@ -257,6 +262,23 @@ namespace Milkman
       // code_review_rate_limit 是独立周限，可选展示
       var crl = Map(d, "code_review_rate_limit");
       if (crl != null) AddWindowFromDict(result, crl, "代码审查");
+      EnsureFiveHourWindow(result.Windows);
+    }
+
+    // 服务端临时不返回 5h 时仍保留版位；字段恢复后自动换回真实数据。
+    static void EnsureFiveHourWindow(List<UsageWindow> windows)
+    {
+      int index = -1;
+      for (int i = 0; i < windows.Count; i++)
+        if (windows[i].Label == "5h") { index = i; break; }
+      if (index < 0)
+        windows.Insert(0, new UsageWindow { Label = "5h", Unlimited = true });
+      else if (index > 0)
+      {
+        UsageWindow window = windows[index];
+        windows.RemoveAt(index);
+        windows.Insert(0, window);
+      }
     }
 
     void AddWindow(GptFetchResult result, Dictionary<string, object> rl, string key, string label)
@@ -922,8 +944,8 @@ namespace Milkman
         DrawBand(g, paths[i], x, bandY, width, window != null ? window.UsedPct : 0);
         if (window != null)
           DrawBandMeta(g, x, width, bandY + BandH + 6,
-            window.Label + " " + (int)(window.UsedPct * 100) + "%",
-            window.ResetMs > 0 ? "重置 " + FormatRemaining(window.ResetMs) : "");
+            window.Label + " " + (window.Unlimited ? "∞" : (int)(window.UsedPct * 100) + "%"),
+            !window.Unlimited && window.ResetMs > 0 ? "重置 " + FormatRemaining(window.ResetMs) : "");
         else
           g.DrawString(error != null ? "⚠ 无数据" : "—", fontTick, error != null ? BrRed : BrSub,
             x, bandY + BandH + 8);
