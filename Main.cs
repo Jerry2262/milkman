@@ -465,7 +465,7 @@ namespace Milkman
     static readonly Color BarGreen = Color.FromArgb(46, 204, 113);
     static readonly Color BarYellow = Color.FromArgb(241, 196, 15);
     static readonly Color BarRed = Color.FromArgb(231, 76, 60);
-    static readonly SolidBrush BrText, BrSub, BrFaint, BrAccent, BrTrack, BrGreen, BrYellow, BrRed;
+    static readonly SolidBrush BrBg, BrText, BrSub, BrFaint, BrAccent, BrTrack, BrGreen, BrYellow, BrRed;
     static readonly Pen PenCloseDim = new Pen(Color.FromArgb(165, 167, 173), 1.6f);
     static readonly Pen PenCloseHot = new Pen(Color.FromArgb(210, 96, 86), 1.6f);
     static readonly Pen PenBorder = new Pen(Color.FromArgb(232, 224, 210));
@@ -473,6 +473,7 @@ namespace Milkman
 
     static MilkmanForm()
     {
+      BrBg = new SolidBrush(Bg);
       BrText = new SolidBrush(TextMain);
       BrSub = new SolidBrush(TextSub);
       BrFaint = new SolidBrush(TextFaint);
@@ -490,14 +491,14 @@ namespace Milkman
     readonly Font fontBig, fontMid, fontTick;
     readonly Rectangle closeRect = new Rectangle(W - 26, 7, 15, 15);
     bool hoverClose;
+    const int NoRetry = -2, GptRetry = -1;
+    int _hoverRetry = NoRetry;
 
     // 吸附与动画（参照 DeepSeekTimeline：WM_NCHITTEST 拖动 + 顶部吸附 + 缓出）
     const int WM_NCHITTEST = 0x84, HTCLIENT = 1, HTCAPTION = 2;
     const int WM_ENTERSIZEMOVE = 0x231, WM_EXITSIZEMOVE = 0x232;
     const int WM_SYSCOMMAND = 0x112, SC_MAXIMIZE = 0xF030;
-    const int WM_NCLBUTTONDBLCLK = 0xA3, WM_NCLBUTTONUP = 0xA2;
-    Point _dragStart;         // 系统拖动起点(区分"单击"与"拖动")
-    int _dragStartTicks;
+    const int WM_NCLBUTTONDBLCLK = 0xA3;
     const int Peek = 4; // 吸附收起时顶部保留的提示条高度(px, 用户微调: 5px 偏粗/3px 偏细)
     bool docked, expanded, dragging, pinned; // pinned = 双击钉住, DockTick 不自动收放
     Rectangle monRect;
@@ -680,20 +681,11 @@ namespace Milkman
       if (m.Msg == WM_ENTERSIZEMOVE)
       {
         dragging = true;
-        _dragStart = Cursor.Position;
-        _dragStartTicks = Environment.TickCount;
-        base.WndProc(ref m);
-        return;
-      }
-      if (m.Msg == WM_NCLBUTTONUP)
-      {
-        TryClickRetry(); // 非客户区松开: 单击(未拖动)才触发重试
         base.WndProc(ref m);
         return;
       }
       if (m.Msg == WM_EXITSIZEMOVE)
       {
-        TryClickRetry(); // 兜底: 系统不发 NCLBUTTONUP 时由拖动结束判定
         // 拖拽结束: 判定 进入吸附 / 保持吸附 / 脱离吸附
         dragging = false;
         monRect = Screen.FromControl(this).Bounds;
@@ -718,7 +710,7 @@ namespace Milkman
         int sx = lp & 0xFFFF; if (sx >= 0x8000) sx -= 0x10000;
         int sy = (lp >> 16) & 0xFFFF; if (sy >= 0x8000) sy -= 0x10000;
         Point pt = PointToClient(new Point(sx, sy));
-        m.Result = (IntPtr)(closeRect.Contains(pt) ? HTCLIENT : HTCAPTION);
+        m.Result = (IntPtr)(closeRect.Contains(pt) || RetryHit(pt) != NoRetry ? HTCLIENT : HTCAPTION);
         return;
       }
       // 拦截"标题栏双击": 吸附(docked)时切换 Pin(钉住), 非吸附时双击无效果
@@ -754,24 +746,34 @@ namespace Milkman
 
     void OnMouseDownHook(object sender, MouseEventArgs e)
     {
+      if (e.Button != MouseButtons.Left) return;
       if (closeRect.Contains(e.Location)) { Close(); return; } // ✕ = 退出程序
-      RefreshAt(e.Location);
+      int retry = RetryHit(e.Location);
+      if (retry != NoRetry) RetryAt(retry);
     }
 
     void OnMouseMoveHook(object sender, MouseEventArgs e)
     {
       bool h = closeRect.Contains(e.Location);
-      if (h != hoverClose)
+      int retry = RetryHit(e.Location);
+      if (h != hoverClose || retry != _hoverRetry)
       {
         hoverClose = h;
-        Cursor = h ? Cursors.Hand : Cursors.Default;
+        _hoverRetry = retry;
+        Cursor = h || retry != NoRetry ? Cursors.Hand : Cursors.Default;
         Invalidate();
       }
     }
 
     void OnMouseLeaveHook(object sender, EventArgs e)
     {
-      if (hoverClose) { hoverClose = false; Cursor = Cursors.Default; Invalidate(); }
+      if (hoverClose || _hoverRetry != NoRetry)
+      {
+        hoverClose = false;
+        _hoverRetry = NoRetry;
+        Cursor = Cursors.Default;
+        Invalidate();
+      }
     }
 
     void OnShownHook(object sender, EventArgs e)
@@ -873,41 +875,59 @@ namespace Milkman
       return p;
     }
 
-    // 单击(按下-松开 未拖动)只刷新所在的数据区块
-    void TryClickRetry()
+    Rectangle RetryButtonRect(int rowY)
     {
-      long dur = Environment.TickCount - _dragStartTicks;
-      Point p = Cursor.Position;
-      bool click = dur >= 0 && dur < 400 &&
-        Math.Abs(p.X - _dragStart.X) < 8 && Math.Abs(p.Y - _dragStart.Y) < 8;
-      if (click) RefreshAt(PointToClient(p));
+      return new Rectangle(W - 76, rowY + 1, 48, 22);
     }
 
-    void RefreshAt(Point p)
+    int RetryHit(Point p)
     {
-      bool started;
-      if (p.Y < GoFirstRowY)
-        started = StartGptRefresh(true);
-      else
-        started = StartGoRefresh((p.Y - GoFirstRowY) / GoRowH, true);
-      if (started) Invalidate();
+      if (_gpt.Error != null && !_gptBusy && RetryButtonRect(12).Contains(p))
+        return GptRetry;
+      for (int row = 0; row < _goAccounts.Count && row < _goBusy.Length; row++)
+        if (_goAccounts[row].Error != null && !_goBusy[row] && RetryButtonRect(GoFirstRowY + row * GoRowH).Contains(p))
+          return row;
+      return NoRetry;
+    }
+
+    void RetryAt(int retry)
+    {
+      bool started = retry == GptRetry ? StartGptRefresh(true) : StartGoRefresh(retry, true);
+      if (started)
+      {
+        _hoverRetry = NoRetry;
+        Cursor = hoverClose ? Cursors.Hand : Cursors.Default;
+        Invalidate();
+      }
     }
 
     string SourceStatus(bool busy, string error, DateTime lastSuccess)
     {
       if (busy) return error != null ? "正在重试…" : lastSuccess == default(DateTime) ? "正在获取…" : "正在刷新…";
-      if (error != null) return "无法获取信息 · 单击重试";
+      if (error != null) return "无法获取信息";
       return lastSuccess == default(DateTime) ? "" : "更新于 " + lastSuccess.ToString("HH:mm:ss");
     }
 
-    void DrawBlockHead(Graphics g, int rowY, SolidBrush dot, string title, string status, bool error, bool busy)
+    void DrawBlockHead(Graphics g, int rowY, SolidBrush dot, string title, string status, bool error, bool busy, bool retry, bool hoverRetry)
     {
       g.FillEllipse(dot, 22, rowY + 7, 9, 9);
       g.DrawString(title, fontBig, BrText, 40, rowY - 1);
       if (!string.IsNullOrEmpty(status))
       {
         SolidBrush brush = error && !busy ? BrRed : busy ? BrSub : BrFaint;
-        g.DrawString(status, fontMid, brush, W - 20 - Wd(g, status, fontMid), rowY + 3);
+        int right = retry ? RetryButtonRect(rowY).Left - 8 : W - 20;
+        g.DrawString(status, fontMid, brush, right - Wd(g, status, fontMid), rowY + 3);
+      }
+      if (retry)
+      {
+        Rectangle r = RetryButtonRect(rowY);
+        using (GraphicsPath p = RoundedRect(r, 5f))
+        {
+          g.FillPath(hoverRetry ? BrAccent : BrTrack, p);
+          g.DrawPath(hoverRetry ? PenCloseHot : PenBarBorder, p);
+        }
+        g.DrawString("重试", fontMid, hoverRetry ? BrBg : BrText,
+          r.Left + (r.Width - Wd(g, "重试", fontMid)) / 2f, r.Top + 3);
       }
     }
 
@@ -962,7 +982,8 @@ namespace Milkman
 
       // ---- 块1: ChatGPT Plus (按实际额度窗口数分段) ----
       DrawBlockHead(g, 12, BrAccent, "ChatGPT Plus",
-        SourceStatus(_gptBusy, _gpt.Error, _gpt.LastSuccess), _gpt.Error != null, _gptBusy);
+        SourceStatus(_gptBusy, _gpt.Error, _gpt.LastSuccess), _gpt.Error != null, _gptBusy,
+        _gpt.Error != null && !_gptBusy, _hoverRetry == GptRetry);
       int gptCount = Math.Max(1, Math.Min(3, _gpt.Windows.Count));
       DrawWindows(g, _gpt.Windows, GptBandPaths[gptCount - 1], BandTop1, _gpt.Error);
 
@@ -980,7 +1001,8 @@ namespace Milkman
         DateTime lastSuccess = account != null ? account.LastSuccess : default(DateTime);
         string error = account != null ? account.Error : _goError;
         DrawBlockHead(g, rowY, BrAccentOff, title,
-          SourceStatus(busy, error, lastSuccess), hasError, busy);
+          SourceStatus(busy, error, lastSuccess), hasError, busy,
+          account != null && error != null && !busy, _hoverRetry == row);
 
         DrawWindows(g, account != null ? account.Windows : null, _goBandPaths[row], bandY, error);
       }
