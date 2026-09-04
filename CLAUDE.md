@@ -32,7 +32,7 @@ powershell.exe -NoProfile -Command "Start-Process 'C:\Users\jerry\AppData\Local\
 - `Config` — 强类型读写 `config.json`（窗口 X/Y、Docked、RefreshSeconds、OpenCodeAccounts）；程序固定开机自启，不设配置开关
 - `DataFetcher` — 无状态网络层；`FetchGpt()` 与每个 `FetchGo(account)` 可并行调用；JSON 字段统一安全读取，序列化器只在短临界区加锁；错误消息截断 80 字
 - `MilkmanForm` — 自绘 UI + 行为：
-  - 版式：宽 520，单 OpenCode 账户时高 168，每增加一个账户高度增加 76；ChatGPT 按实际窗口数分 1–3 段；Brush/Pen/BandPath 缓存复用，低频动态文本直接测量，禁止缓存不断变化的倒计时字符串
+  - 版式：宽 520，无 OpenCode 账户（config 中 `OpenCodeAccounts` 留空 = 未订阅，整块隐藏）时高 92，单账户 168、每增加一个账户高度增加 76；ChatGPT 按实际窗口数分 1–3 段；Brush/Pen/BandPath 缓存复用，低频动态文本直接测量，禁止缓存不断变化的倒计时字符串
   - 吸附：`WM_NCHITTEST`→`HTCAPTION` 系统级拖动；`WM_ENTERSIZEMOVE/EXITSIZEMOVE` 判定出入吸附（Top≤monTop+8 吸附，>monTop+30 脱离）；`DockTick` 30ms 缓出（dy/3，`Peek=4`）；双击 Pin 后立即展开并停止 DockTimer，取消 Pin 时恢复
   - 独立刷新：一个低频 `_refreshTimer` 仅负责调度；ChatGPT 与各 Go 账户分别维护 busy/auto/error/last-success，失败只暂停自身并保留旧数据，点击对应重试按钮单独重试
   - 多屏：`monRect` 可能为负坐标屏（副屏在顶部），坐标计算要考虑

@@ -527,7 +527,7 @@ namespace Milkman
       _goBusy = new bool[_cfg.OpenCodeAccounts.Count];
       _goAuto = new bool[_cfg.OpenCodeAccounts.Count];
       for (int i = 0; i < _goAuto.Length; i++) _goAuto[i] = true;
-      _goRowCount = Math.Max(1, _cfg.OpenCodeAccounts.Count);
+      _goRowCount = _cfg.OpenCodeAccounts.Count; // 列表留空 = 未订阅, 整块隐藏
       _formH = 16 + (_goRowCount + 1) * GoRowH;
       _goBandPaths = new GraphicsPath[_goRowCount][];
       for (int row = 0; row < _goRowCount; row++)

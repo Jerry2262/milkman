@@ -61,7 +61,7 @@ build.bat          # 编译到 %LOCALAPPDATA%\Milkman\Milkman.exe
 ```
 
 - `RefreshSeconds`：刷新间隔（默认 60s）
-- `OpenCodeAccounts`：账户列表；增加项目后，浮窗会为每个账户增加一行并同时取数
+- `OpenCodeAccounts`：账户列表；增加项目后，浮窗会为每个账户增加一行并同时取数；留空数组 `[]` 则隐藏 OpenCode Go 区块（退订时用，续订后把账户加回即恢复）
 - `Name`：浮窗中的账户名称
 - `AuthPath`：该账户的 opencode `auth.json` 路径
 
