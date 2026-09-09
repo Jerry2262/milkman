@@ -499,7 +499,7 @@ namespace Milkman
     const int WM_ENTERSIZEMOVE = 0x231, WM_EXITSIZEMOVE = 0x232;
     const int WM_SYSCOMMAND = 0x112, SC_MAXIMIZE = 0xF030;
     const int WM_NCLBUTTONDBLCLK = 0xA3;
-    const int Peek = 4; // 吸附收起时顶部保留的提示条高度(px, 用户微调: 5px 偏粗/3px 偏细)
+    const int Peek = 5; // 吸附收起时顶部保留的提示条高度(px), 与 DeepSeekTimeline 一致
     bool docked, expanded, dragging, pinned; // pinned = 双击钉住, DockTick 不自动收放
     Rectangle monRect;
     Timer _dockTimer;
