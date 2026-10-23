@@ -68,6 +68,9 @@ namespace Milkman
 
     [System.Runtime.InteropServices.DllImport("user32.dll")]
     public static extern bool GetWindowRect(IntPtr hWnd, out RECT r);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    public static extern int GetWindowLong(IntPtr hWnd, int index);
   }
 
   // =======================================================================
@@ -76,7 +79,8 @@ namespace Milkman
   class OpenCodeAccountConfig
   {
     public string Name = "";
-    public string AuthPath = "";
+    public string Key = "";      // OpenCode Go API key（OpenCode 2 从 Console 获取，优先使用）
+    public string AuthPath = ""; // OpenCode 1 的 auth.json 路径（Key 为空时回退）
   }
 
   class Config
@@ -114,17 +118,16 @@ namespace Milkman
 
     static List<OpenCodeAccountConfig> DefaultOpenCodeAccounts()
     {
-      string local = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+      // OpenCode 1 的常见凭据位置：Windows 本地数据目录，或 XDG 风格的 home
+      string localData = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "opencode", "auth.json");
+      string home = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
         ".local", "share", "opencode", "auth.json");
-      string wsl = Path.Combine(@"\\wsl.localhost\Ubuntu-24.04", "home", "jerry",
-        ".local", "share", "opencode", "auth.json");
+      string path = File.Exists(localData) ? localData : File.Exists(home) ? home : null;
+      if (path == null) return new List<OpenCodeAccountConfig>(); // 未配置账户时整块隐藏
       return new List<OpenCodeAccountConfig>
       {
-        new OpenCodeAccountConfig
-        {
-          Name = "个人",
-          AuthPath = File.Exists(local) ? local : wsl
-        }
+        new OpenCodeAccountConfig { Name = "个人", AuthPath = path }
       };
     }
   }
@@ -137,6 +140,7 @@ namespace Milkman
     public string Label;
     public double UsedPct, ResetMs;
     public bool Unlimited;
+    public bool NotStarted; // rolling 窗口无用量: 服务端返回的是占位 resetsAt
   }
 
   class GptFetchResult
@@ -331,13 +335,18 @@ namespace Milkman
 
     void FetchGoCore(GoAccountSnapshot account, OpenCodeAccountConfig cfg)
     {
-      string authPath = cfg.AuthPath;
-      if (string.IsNullOrEmpty(authPath) || !File.Exists(authPath))
-        throw new Exception("未找到 opencode auth.json");
-      var d = Deserialize(File.ReadAllText(authPath)) as Dictionary<string, object>;
-      var goe = Map(d, "opencode-go");
-      string key = Text(goe, "key").Trim();
-      if (key.Length == 0) throw new Exception("未登录 OpenCode Go");
+      // OpenCode 2 把凭据迁进 opencode.db，auth.json 不再更新；配置里的 Key 优先。
+      string key = (cfg.Key ?? "").Trim();
+      if (key.Length == 0)
+      {
+        string authPath = cfg.AuthPath;
+        if (string.IsNullOrEmpty(authPath) || !File.Exists(authPath))
+          throw new Exception("未配置 Go key");
+        var d = Deserialize(File.ReadAllText(authPath)) as Dictionary<string, object>;
+        var goe = Map(d, "opencode-go");
+        key = Text(goe, "key").Trim();
+        if (key.Length == 0) throw new Exception("未登录 OpenCode Go");
+      }
 
       string body; int status;
       HttpGetWithStatus(GoUsageUrl, key, out body, out status);
@@ -347,12 +356,12 @@ namespace Milkman
       var u = Deserialize(body) as Dictionary<string, object>;
       var usage = Map(u, "usage");
       if (usage == null) throw new Exception("Go usage 响应无法解析");
-      account.Windows[0] = ParseGoWindow(usage, "rolling", "5h");
-      account.Windows[1] = ParseGoWindow(usage, "weekly", "周");
-      account.Windows[2] = ParseGoWindow(usage, "monthly", "月");
+      account.Windows[0] = ParseGoWindow(usage, "rolling", "5h", true);
+      account.Windows[1] = ParseGoWindow(usage, "weekly", "周", false);
+      account.Windows[2] = ParseGoWindow(usage, "monthly", "月", false);
     }
 
-    UsageWindow ParseGoWindow(Dictionary<string, object> usage, string key, string label)
+    UsageWindow ParseGoWindow(Dictionary<string, object> usage, string key, string label, bool rolling)
     {
       var w = Map(usage, key);
       if (w == null) return null;
@@ -363,6 +372,10 @@ namespace Milkman
       DateTimeOffset t;
       if (DateTimeOffset.TryParse(resetsAt, out t))
         g.ResetMs = (long)((t.UtcDateTime - new DateTime(1970, 1, 1)).TotalMilliseconds);
+      // 无用量时 rolling 的 resetsAt 是「现在 + 5h」占位值（openusage 同款判定），显示“未开始”而非倒计时
+      if (rolling && g.UsedPct == 0 && g.ResetMs > 0
+        && Math.Abs(g.ResetMs - Program.NowUnixMs() - 5 * 3600 * 1000L) <= 2000)
+        g.NotStarted = true;
       return g;
     }
 
@@ -497,6 +510,8 @@ namespace Milkman
     // 吸附与动画（参照 DeepSeekTimeline：WM_NCHITTEST 拖动 + 顶部吸附 + 缓出）
     const int WM_NCHITTEST = 0x84, HTCLIENT = 1, HTCAPTION = 2;
     const int WM_ENTERSIZEMOVE = 0x231, WM_EXITSIZEMOVE = 0x232;
+    const int WM_WINDOWPOSCHANGED = 0x47, WM_STYLECHANGED = 0x7D;
+    const int GWL_EXSTYLE = -20, WS_EX_TOPMOST = 0x00000008;
     const int WM_SYSCOMMAND = 0x112, SC_MAXIMIZE = 0xF030;
     const int WM_NCLBUTTONDBLCLK = 0xA3;
     const int Peek = 5; // 吸附收起时顶部保留的提示条高度(px), 与 DeepSeekTimeline 一致
@@ -676,8 +691,25 @@ namespace Milkman
       }
     }
 
+    // TopMost 是 WinForms 的期望状态，原生窗口被降级后该属性仍可能为 true；
+    // 只在收到层级/样式变更通知后补回缺失标志，不轮询、不主动抢前台。
+    void EnsureTopMost()
+    {
+      if (!IsHandleCreated || IsDisposed || !TopMost) return;
+      if ((NativeMethods.GetWindowLong(Handle, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0) return;
+      NativeMethods.SetWindowPos(Handle, new IntPtr(-1), 0, 0, 0, 0,
+        0x0001 | 0x0002 | 0x0010); // HWND_TOPMOST; NOSIZE | NOMOVE | NOACTIVATE
+    }
+
     protected override void WndProc(ref Message m)
     {
+      if (m.Msg == WM_WINDOWPOSCHANGED
+        || (m.Msg == WM_STYLECHANGED && m.WParam.ToInt64() == GWL_EXSTYLE))
+      {
+        base.WndProc(ref m);
+        EnsureTopMost();
+        return;
+      }
       if (m.Msg == WM_ENTERSIZEMOVE)
       {
         dragging = true;
@@ -787,6 +819,7 @@ namespace Milkman
         NativeMethods.DwmExtendFrameIntoClientArea(Handle, ref mg);
       }
       catch { }
+      EnsureTopMost(); // 显示完成后再确认一次原生置顶标志
     }
 
     void SaveState()
@@ -965,7 +998,9 @@ namespace Milkman
         if (window != null)
           DrawBandMeta(g, x, width, bandY + BandH + 6,
             window.Label + " " + (window.Unlimited ? "∞" : (int)(window.UsedPct * 100) + "%"),
-            !window.Unlimited && window.ResetMs > 0 ? "重置 " + FormatRemaining(window.ResetMs) : "");
+            window.Unlimited ? ""
+              : window.NotStarted ? "未开始"
+              : window.ResetMs > 0 ? "重置 " + FormatRemaining(window.ResetMs) : "");
         else
           g.DrawString(error != null ? "⚠ 无数据" : "—", fontTick, error != null ? BrRed : BrSub,
             x, bandY + BandH + 8);
