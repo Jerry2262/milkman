@@ -553,7 +553,9 @@ namespace Milkman
       fontTick = new Font("Microsoft YaHei UI", 7.5f, FontStyle.Regular);
       Font = fontMid;
 
-      Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
+      // ExtractAssociatedIcon 不接受 UNC 路径(网络共享/WSL 互操作路径启动), 抛 ArgumentException 会中断启动
+      try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); }
+      catch (ArgumentException) { } // 取不到就保留系统默认图标
       FormBorderStyle = FormBorderStyle.None;
       TopMost = true;
       ShowInTaskbar = false;
