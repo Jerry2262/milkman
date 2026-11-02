@@ -553,6 +553,7 @@ namespace Milkman
       fontTick = new Font("Microsoft YaHei UI", 7.5f, FontStyle.Regular);
       Font = fontMid;
 
+      Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
       FormBorderStyle = FormBorderStyle.None;
       TopMost = true;
       ShowInTaskbar = false;

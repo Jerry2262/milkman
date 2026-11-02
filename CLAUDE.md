@@ -19,7 +19,7 @@ build.bat
 # 从 WSL 手动编译（/out 必须是 Windows 本地路径，源码路径用 wslpath 转换）
 /mnt/c/Windows/Microsoft.NET/Framework64/v4.0.30319/csc.exe /nologo /target:winexe /platform:anycpu \
   /r:System.dll /r:System.Core.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll /r:System.Web.Extensions.dll \
-  /codepage:65001 /out:"C:\Users\<user>\AppData\Local\Milkman\Milkman.exe" "$(wslpath -w Main.cs)"
+  /codepage:65001 /win32icon:"$(wslpath -w app.ico)" /out:"C:\Users\<user>\AppData\Local\Milkman\Milkman.exe" "$(wslpath -w Main.cs)"
 
 # 重启浮窗（编译后验证）
 powershell.exe -NoProfile -Command "Stop-Process -Name Milkman -Force -ErrorAction SilentlyContinue"

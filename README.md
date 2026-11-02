@@ -35,12 +35,14 @@ build.bat
 
 产物为 `%LOCALAPPDATA%\Milkman\Milkman.exe`，双击即可运行。程序每次启动都会登记开机自启。
 
+程序与窗口使用内嵌的多尺寸图标，无需额外携带图标文件。图标源文件为 [app.svg](<app.svg>)，编译使用 [app.ico](<app.ico>)。
+
 在 WSL 中手动编译（`/out` 必须是 Windows 本地路径，不能是 `\\wsl.localhost\...`）：
 
 ```bash
 /mnt/c/Windows/Microsoft.NET/Framework64/v4.0.30319/csc.exe /nologo /target:winexe /platform:anycpu \
   /r:System.dll /r:System.Core.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll /r:System.Web.Extensions.dll \
-  /codepage:65001 /out:"C:\path\to\Milkman.exe" "$(wslpath -w Main.cs)"
+  /codepage:65001 /win32icon:"$(wslpath -w app.ico)" /out:"C:\path\to\Milkman.exe" "$(wslpath -w Main.cs)"
 ```
 
 ## 配置
