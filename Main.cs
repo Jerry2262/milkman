@@ -4,14 +4,15 @@
 //   ChatGPT/Codex:  %USERPROFILE%\.codex\auth.json 的 OAuth token -> chatgpt.com/backend-api/wham/usage（非官方）
 //   OpenCode Go:    opencode-go.key -> https://opencode.ai/zen/go/v1/usage（官方账户级消费百分比）
 using System;
+using System.Collections;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.IO;
 using System.Net;
 using System.Text;
 using System.Threading.Tasks;
-using System.Web.Script.Serialization;
 using System.Windows.Forms;
 using Microsoft.Win32;
 
@@ -83,26 +84,35 @@ namespace Milkman
     public string AuthPath = ""; // OpenCode 1 的 auth.json 路径（Key 为空时回退）
   }
 
+  // 注意：新增配置字段时必须同时更新 Parse() 与 ToDictionary()，否则该字段会静默读不到/存不住。
   class Config
   {
     public int X = -1, Y = -1;
     public bool Docked = false;
     public int RefreshSeconds = 60;
-    public List<OpenCodeAccountConfig> OpenCodeAccounts = DefaultOpenCodeAccounts();
+    public List<OpenCodeAccountConfig> OpenCodeAccounts = new List<OpenCodeAccountConfig>();
 
     public static Config Load()
     {
       try
       {
         var path = Path.Combine(Program.DataDir(), "config.json");
-        if (!File.Exists(path)) return new Config();
-        var cfg = new JavaScriptSerializer().Deserialize<Config>(File.ReadAllText(path));
-        if (cfg == null) return new Config();
-        if (cfg.OpenCodeAccounts == null) cfg.OpenCodeAccounts = new List<OpenCodeAccountConfig>();
-        return cfg;
+        if (!File.Exists(path)) return Defaults();
+        try { return Parse(File.ReadAllText(path)); }
+        catch
+        {
+          // 解析失败时先保留原文件副本，避免关窗时 SaveState 用默认值静默覆盖
+          try { File.Copy(path, path + ".bad", true); } catch { }
+          return Defaults();
+        }
       }
       catch { }
-      return new Config();
+      return Defaults();
+    }
+
+    static Config Defaults()
+    {
+      return new Config { OpenCodeAccounts = DefaultOpenCodeAccounts() };
     }
 
     public void Save()
@@ -111,9 +121,65 @@ namespace Milkman
       {
         Directory.CreateDirectory(Program.DataDir());
         File.WriteAllText(Path.Combine(Program.DataDir(), "config.json"),
-          new JavaScriptSerializer().Serialize(this), new UTF8Encoding(false));
+          Json.Serialize(ToDictionary()), new UTF8Encoding(false));
       }
       catch { }
+    }
+
+    public static Config Parse(string json)
+    {
+      var d = ConfigObject(Json.Parse(json));
+      var cfg = new Config();
+      object value;
+      if (d.TryGetValue("X", out value) && value != null) cfg.X = Convert.ToInt32(value, CultureInfo.InvariantCulture);
+      if (d.TryGetValue("Y", out value) && value != null) cfg.Y = Convert.ToInt32(value, CultureInfo.InvariantCulture);
+      if (d.TryGetValue("Docked", out value) && value != null) cfg.Docked = Convert.ToBoolean(value, CultureInfo.InvariantCulture);
+      if (d.TryGetValue("RefreshSeconds", out value) && value != null)
+        cfg.RefreshSeconds = Convert.ToInt32(value, CultureInfo.InvariantCulture);
+      // 0/负数会让 WinForms Timer 抛 ArgumentOutOfRangeException，直接回落默认间隔
+      if (cfg.RefreshSeconds <= 0) cfg.RefreshSeconds = 60;
+      if (d.TryGetValue("OpenCodeAccounts", out value))
+      {
+        if (value != null)
+        {
+          var list = value as IList;
+          if (list == null) throw new FormatException("accounts must be an array");
+          foreach (var item in list)
+          {
+            if (item == null) continue; // 手写配置里的 null 元素直接忽略，避免后续解引用崩溃
+            var entry = ConfigObject(item);
+            var account = new OpenCodeAccountConfig();
+            if (entry.TryGetValue("Name", out value)) account.Name = value == null ? null : Convert.ToString(value, CultureInfo.InvariantCulture);
+            if (entry.TryGetValue("Key", out value)) account.Key = value == null ? null : Convert.ToString(value, CultureInfo.InvariantCulture);
+            if (entry.TryGetValue("AuthPath", out value)) account.AuthPath = value == null ? null : Convert.ToString(value, CultureInfo.InvariantCulture);
+            cfg.OpenCodeAccounts.Add(account);
+          }
+        }
+      }
+      else cfg.OpenCodeAccounts = DefaultOpenCodeAccounts();
+      return cfg;
+    }
+
+    static Dictionary<string, object> ConfigObject(object value)
+    {
+      var source = value as Dictionary<string, object>;
+      if (source == null) throw new FormatException("config must be an object");
+      var result = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
+      foreach (var entry in source) result[entry.Key] = entry.Value;
+      return result;
+    }
+
+    Dictionary<string, object> ToDictionary()
+    {
+      var accounts = new List<object>();
+      foreach (var account in OpenCodeAccounts)
+        accounts.Add(account == null ? null : new Dictionary<string, object> {
+          { "Name", account.Name }, { "Key", account.Key }, { "AuthPath", account.AuthPath }
+        });
+      return new Dictionary<string, object> {
+        { "X", X }, { "Y", Y }, { "Docked", Docked }, { "RefreshSeconds", RefreshSeconds },
+        { "OpenCodeAccounts", accounts }
+      };
     }
 
     static List<OpenCodeAccountConfig> DefaultOpenCodeAccounts()
@@ -169,8 +235,6 @@ namespace Milkman
     const string GoUsageUrl = "https://opencode.ai/zen/go/v1/usage";
     // Cloudflare 1010: opencode.ai 按浏览器签名拦截, 需浏览器 UA
     const string BrowserUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
-    static readonly JavaScriptSerializer Js = new JavaScriptSerializer();
-    static readonly object JsLock = new object();
 
     public GptFetchResult FetchGpt()
     {
@@ -188,10 +252,10 @@ namespace Milkman
 
     static object Deserialize(string json)
     {
-      lock (JsLock) return Js.DeserializeObject(json);
+      return Json.Parse(json);
     }
 
-    static string Serialize(object value) { lock (JsLock) return Js.Serialize(value); }
+    static string Serialize(object value) { return Json.Serialize(value); }
 
     static object Value(Dictionary<string, object> d, string key)
     {
@@ -455,8 +519,11 @@ namespace Milkman
     {
       try
       {
+        string value = "\"" + Application.ExecutablePath + "\"";
+        using (var k = Registry.CurrentUser.OpenSubKey(RunKey))
+          if (k != null && string.Equals(k.GetValue(Name) as string, value, StringComparison.Ordinal)) return;
         using (var k = Registry.CurrentUser.CreateSubKey(RunKey))
-          k.SetValue(Name, "\"" + Application.ExecutablePath + "\"");
+          k.SetValue(Name, value, RegistryValueKind.String);
       }
       catch { }
     }
@@ -1068,6 +1135,173 @@ namespace Milkman
       var t = TimeSpan.FromMilliseconds(ms);
       if (t.TotalDays >= 1) return (int)t.TotalDays + "天" + t.Hours + "h";
       return (int)t.TotalHours + "h" + t.Minutes.ToString("00") + "m";
+    }
+  }
+
+  // Small JSON value tree: no reflection serializer or ASP.NET assembly initialization.
+  // Keep number tokens intact when rewriting OAuth files, including unknown fields.
+  static class Json
+  {
+    const int MaxDepth = 100, MaxLength = 2097152;
+    public static object Parse(string text)
+    {
+      if (text == null || text.Length > MaxLength) throw new FormatException("JSON size limit");
+      var reader = new Reader(text);
+      object value = reader.Value(0);
+      reader.Space();
+      if (reader.Position != text.Length) throw new FormatException("Trailing JSON content");
+      return value;
+    }
+    public static string Serialize(object value)
+    {
+      var text = new StringBuilder();
+      Write(text, value, 0);
+      if (text.Length > MaxLength) throw new FormatException("JSON size limit");
+      return text.ToString();
+    }
+    static void Write(StringBuilder text, object value, int depth)
+    {
+      if (depth > MaxDepth) throw new FormatException("JSON depth limit");
+      if (value == null) { text.Append("null"); return; }
+      var number = value as Number;
+      if (number != null) { text.Append(number.Token); return; }
+      var str = value as string;
+      if (str != null) { Quote(text, str); return; }
+      if (value is bool) { text.Append((bool)value ? "true" : "false"); return; }
+      var map = value as IDictionary<string, object>;
+      if (map != null)
+      {
+        text.Append('{'); bool first = true;
+        foreach (var entry in map)
+        {
+          if (!first) text.Append(','); first = false;
+          Quote(text, entry.Key); text.Append(':'); Write(text, entry.Value, depth + 1);
+        }
+        text.Append('}'); return;
+      }
+      var list = value as IList;
+      if (list != null)
+      {
+        text.Append('[');
+        for (int i = 0; i < list.Count; i++) { if (i != 0) text.Append(','); Write(text, list[i], depth + 1); }
+        text.Append(']'); return;
+      }
+      switch (Type.GetTypeCode(value.GetType()))
+      {
+        case TypeCode.Byte: case TypeCode.SByte: case TypeCode.Int16: case TypeCode.UInt16:
+        case TypeCode.Int32: case TypeCode.UInt32: case TypeCode.Int64: case TypeCode.UInt64:
+        case TypeCode.Decimal: case TypeCode.Double: case TypeCode.Single:
+          string token = value is double ? ((double)value).ToString("R", CultureInfo.InvariantCulture)
+            : value is float ? ((float)value).ToString("R", CultureInfo.InvariantCulture)
+            : Convert.ToString(value, CultureInfo.InvariantCulture);
+          if (token == "NaN" || token == "Infinity" || token == "-Infinity") throw new FormatException("Invalid JSON number");
+          text.Append(token); return;
+        default: throw new ArgumentException("Unsupported JSON value");
+      }
+    }
+    static void Quote(StringBuilder text, string value)
+    {
+      if (value == null) throw new ArgumentException("Null JSON property name");
+      text.Append('"');
+      foreach (char c in value)
+      {
+        if (c == '"' || c == '\\') { text.Append('\\'); text.Append(c); }
+        else if (c < 32 || char.IsSurrogate(c)) { text.Append("\\u"); text.Append(((int)c).ToString("x4", CultureInfo.InvariantCulture)); }
+        else text.Append(c);
+      }
+      text.Append('"');
+    }
+    sealed class Reader
+    {
+      readonly string text;
+      public int Position;
+      public Reader(string text) { this.text = text; }
+      public void Space() { while (Position < text.Length && (text[Position] == ' ' || text[Position] == '\t' || text[Position] == '\r' || text[Position] == '\n')) Position++; }
+      bool Take(char c) { if (Position < text.Length && text[Position] == c) { Position++; return true; } return false; }
+      void Need(char c) { if (!Take(c)) throw new FormatException("Invalid JSON syntax"); }
+      public object Value(int depth)
+      {
+        if (depth > MaxDepth) throw new FormatException("JSON depth limit");
+        Space(); if (Position >= text.Length) throw new FormatException("Incomplete JSON");
+        char c = text[Position];
+        if (c == '"') return String();
+        if (Take('{'))
+        {
+          var map = new Dictionary<string, object>(); Space(); if (Take('}')) return map;
+          do { Space(); string key = String(); Space(); Need(':'); map[key] = Value(depth + 1); Space(); if (Take('}')) return map; Need(','); } while (true);
+        }
+        if (Take('['))
+        {
+          var list = new List<object>(); Space(); if (Take(']')) return list.ToArray();
+          do { list.Add(Value(depth + 1)); Space(); if (Take(']')) return list.ToArray(); Need(','); } while (true);
+        }
+        if (c == 't') { Literal("true"); return true; }
+        if (c == 'f') { Literal("false"); return false; }
+        if (c == 'n') { Literal("null"); return null; }
+        int start = Position; Take('-');
+        if (!Take('0')) { if (Position >= text.Length || text[Position] < '1' || text[Position] > '9') throw new FormatException("Invalid JSON number"); Digits(); }
+        if (Take('.')) { int digits = Position; Digits(); if (digits == Position) throw new FormatException("Invalid JSON fraction"); }
+        if (Take('e') || Take('E')) { if (!Take('+')) Take('-'); int digits = Position; Digits(); if (digits == Position) throw new FormatException("Invalid JSON exponent"); }
+        return new Number(text.Substring(start, Position - start));
+      }
+      void Digits() { while (Position < text.Length && text[Position] >= '0' && text[Position] <= '9') Position++; }
+      void Literal(string value) { for (int i = 0; i < value.Length; i++) Need(value[i]); }
+      string String()
+      {
+        Need('"'); var value = new StringBuilder();
+        while (Position < text.Length)
+        {
+          char c = text[Position++];
+          if (c == '"') return value.ToString();
+          if (c < 32) throw new FormatException("Invalid JSON string");
+          if (c != '\\') { value.Append(c); continue; }
+          if (Position >= text.Length) throw new FormatException("Incomplete JSON escape");
+          c = text[Position++];
+          switch (c)
+          {
+            case '"': case '\\': case '/': value.Append(c); break;
+            case 'b': value.Append('\b'); break; case 'f': value.Append('\f'); break;
+            case 'n': value.Append('\n'); break; case 'r': value.Append('\r'); break; case 't': value.Append('\t'); break;
+            case 'u':
+              int code = 0;
+              for (int i = 0; i < 4; i++)
+              {
+                if (Position >= text.Length) throw new FormatException("Incomplete JSON unicode escape");
+                char hex = text[Position++];
+                int n = hex >= '0' && hex <= '9' ? hex - '0' : hex >= 'a' && hex <= 'f' ? hex - 'a' + 10 : hex >= 'A' && hex <= 'F' ? hex - 'A' + 10 : -1;
+                if (n < 0) throw new FormatException("Invalid JSON unicode escape");
+                code = code * 16 + n;
+              }
+              value.Append((char)code); break;
+            default: throw new FormatException("Invalid JSON escape");
+          }
+        }
+        throw new FormatException("Unterminated JSON string");
+      }
+    }
+    sealed class Number : IConvertible
+    {
+      public readonly string Token;
+      public Number(string token) { Token = token; }
+      decimal Decimal() { return decimal.Parse(Token, NumberStyles.Float, CultureInfo.InvariantCulture); }
+      public override string ToString() { return Token; }
+      public TypeCode GetTypeCode() { return TypeCode.Decimal; }
+      public bool ToBoolean(IFormatProvider p) { return Convert.ToBoolean(Decimal()); }
+      public byte ToByte(IFormatProvider p) { return Convert.ToByte(Decimal()); }
+      public char ToChar(IFormatProvider p) { throw new InvalidCastException(); }
+      public DateTime ToDateTime(IFormatProvider p) { throw new InvalidCastException(); }
+      public decimal ToDecimal(IFormatProvider p) { return Decimal(); }
+      public double ToDouble(IFormatProvider p) { return double.Parse(Token, NumberStyles.Float, CultureInfo.InvariantCulture); }
+      public short ToInt16(IFormatProvider p) { return Convert.ToInt16(Decimal()); }
+      public int ToInt32(IFormatProvider p) { return Convert.ToInt32(Decimal()); }
+      public long ToInt64(IFormatProvider p) { return Convert.ToInt64(Decimal()); }
+      public sbyte ToSByte(IFormatProvider p) { return Convert.ToSByte(Decimal()); }
+      public float ToSingle(IFormatProvider p) { return float.Parse(Token, NumberStyles.Float, CultureInfo.InvariantCulture); }
+      public string ToString(IFormatProvider p) { return Token; }
+      public object ToType(Type type, IFormatProvider p) { if (type == typeof(string)) return Token; if (type == typeof(double)) return ToDouble(p); if (type == typeof(float)) return ToSingle(p); return Convert.ChangeType(Decimal(), type, p); }
+      public ushort ToUInt16(IFormatProvider p) { return Convert.ToUInt16(Decimal()); }
+      public uint ToUInt32(IFormatProvider p) { return Convert.ToUInt32(Decimal()); }
+      public ulong ToUInt64(IFormatProvider p) { return Convert.ToUInt64(Decimal()); }
     }
   }
 }

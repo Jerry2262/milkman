@@ -41,7 +41,7 @@ build.bat
 
 ```bash
 /mnt/c/Windows/Microsoft.NET/Framework64/v4.0.30319/csc.exe /nologo /target:winexe /platform:anycpu \
-  /r:System.dll /r:System.Core.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll /r:System.Web.Extensions.dll \
+  /r:System.dll /r:System.Core.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll \
   /codepage:65001 /win32icon:"$(wslpath -w app.ico)" /out:"C:\path\to\Milkman.exe" "$(wslpath -w Main.cs)"
 ```
 
@@ -68,6 +68,8 @@ build.bat
 - `AuthPath`：OpenCode 1 的 `auth.json` 路径；`Key` 为空时从中读取 `opencode-go.key`
 - `X` / `Y` / `Docked`：窗口位置与吸附状态，由程序自动维护
 
+`config.json` 必须是标准 JSON：程序只接受标准语法，单引号、无引号键之类的宽松写法会被拒绝。解析失败时程序回落到默认配置，并把原文件备份为 `config.json.bad`，避免原配置被静默覆盖。
+
 首次运行且没有配置账户时，程序会探测本机 OpenCode 1 的 `%LOCALAPPDATA%\opencode\auth.json` 和 `~/.local/share/opencode/auth.json`；找不到就隐藏 Go 区块，填好配置后自动显示。
 
 ## 使用
@@ -83,6 +85,18 @@ build.bat
 - **换 Go key**：在 Console 重新创建后更新 `config.json` 里的 `Key`，下一轮刷新生效
 - **OpenCode 1 用户**：把 `AuthPath` 指向 `auth.json` 即可，不需要 `Key`
 - **ChatGPT token**：过期后自动用 `refresh_token` 刷新并写回 `auth.json`
+
+## 启动开销与回归检查
+
+JSON 读写使用 [Main.cs](<Main.cs>) 中的轻量值树实现，不加载 ASP.NET 序列化组件。配置已明确账户列表时不再探测默认认证路径；自启注册表值未变化时不重复写入。首次额度刷新仍在窗口显示时立即执行，刷新间隔不变。
+
+在 Windows 中运行：
+
+```bat
+tests\run.bat
+```
+
+[JsonRegression.cs](<tests/JsonRegression.cs>) 使用合成数据检查配置兼容性（含空值回落、账户 null 过滤）、授权 JSON 未知字段与数字精度、非法输入、并发读写，以及与原序列化器的差分结果；不读取真实认证文件、不请求 API。测试程序才会引用旧序列化组件作为对照，正式程序不依赖它。
 
 ## 已知限制
 

@@ -16,9 +16,12 @@ Milkman — Windows 专用的单文件 WinForms 浮窗，显示 ChatGPT Plus（P
 # 编译（Windows cmd 中运行 build.bat，双击亦可；源码路径取自脚本所在目录）
 build.bat
 
+# 回归检查（Windows cmd 中运行；仅合成数据，不读真实凭据、不请求 API；改 Main.cs 后必跑）
+tests\run.bat
+
 # 从 WSL 手动编译（/out 必须是 Windows 本地路径，源码路径用 wslpath 转换）
 /mnt/c/Windows/Microsoft.NET/Framework64/v4.0.30319/csc.exe /nologo /target:winexe /platform:anycpu \
-  /r:System.dll /r:System.Core.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll /r:System.Web.Extensions.dll \
+  /r:System.dll /r:System.Core.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll \
   /codepage:65001 /win32icon:"$(wslpath -w app.ico)" /out:"C:\Users\<user>\AppData\Local\Milkman\Milkman.exe" "$(wslpath -w Main.cs)"
 
 # 重启浮窗（编译后验证）
@@ -29,15 +32,16 @@ powershell.exe -NoProfile -Command 'Start-Process "$env:LOCALAPPDATA\Milkman\Mil
 ## 架构（单文件 Main.cs，按 region 组织）
 
 - `Program` — 入口；TLS1.2 显式设置（.NET 4.x 默认不协商，必踩坑）；写自启注册表；`DataDir()` = `%LOCALAPPDATA%\Milkman`
-- `Config` — 强类型读写 `config.json`（窗口 X/Y、Docked、RefreshSeconds、OpenCodeAccounts）；程序固定开机自启，不设配置开关
-- `DataFetcher` — 无状态网络层；`FetchGpt()` 与每个 `FetchGo(account)` 可并行调用；JSON 字段统一安全读取，序列化器只在短临界区加锁；错误消息截断 80 字
+- `Config` — 显式字段映射读写 `config.json`（窗口 X/Y、Docked、RefreshSeconds、OpenCodeAccounts）；程序固定开机自启，不设配置开关；解析失败回落默认并备份 `config.json.bad`；新增字段需同步 `Parse()` / `ToDictionary()`，否则会静默读不到/存不住
+- `DataFetcher` — 无状态网络层；`FetchGpt()` 与每个 `FetchGo(account)` 可并行调用；JSON 字段统一安全读取，轻量 JSON 值树逐调用独立解析，不依赖 ASP.NET 或共享序列化器锁；错误消息截断 80 字
 - `MilkmanForm` — 自绘 UI + 行为：
   - 版式：宽 520，无 OpenCode 账户（config 中 `OpenCodeAccounts` 留空 = 未订阅，整块隐藏）时高 92，单账户 168、每增加一个账户高度增加 76；ChatGPT 按实际窗口数分 1–3 段；Brush/Pen/BandPath 缓存复用，低频动态文本直接测量，禁止缓存不断变化的倒计时字符串
   - 吸附：`WM_NCHITTEST`→`HTCAPTION` 系统级拖动；`WM_ENTERSIZEMOVE/EXITSIZEMOVE` 判定出入吸附（Top≤monTop+8 吸附，>monTop+30 脱离）；`DockTick` 30ms 缓出（dy/3，`Peek=5`）；双击 Pin 后立即展开并停止 DockTimer，取消 Pin 时恢复
   - 独立刷新：一个低频 `_refreshTimer` 仅负责调度；ChatGPT 与各 Go 账户分别维护 busy/auto/error/last-success，失败只暂停自身并保留旧数据，点击对应重试按钮单独重试
   - 置顶：`TopMost=true` 只是 WinForms 期望状态，原生窗口可能被降级而属性仍为 true；`EnsureTopMost()` 在 `WM_WINDOWPOSCHANGED` / `WM_STYLECHANGED(GWL_EXSTYLE)` 与 `OnShown` 后检查 `WS_EX_TOPMOST`，丢失才补回（不轮询、不抢焦点）
   - 多屏：`monRect` 可能为负坐标屏（副屏在顶部），坐标计算要考虑
-- `AutoStart` — HKCU Run 的 `Milkman` 键
+- `Json` — 同文件内的标准 JSON 读写；保留未知授权字段的数字词法，避免装载 ASP.NET。改动 `Json` / `Config` / 响应解析后必须跑 `tests\run.bat`（仅合成数据）。
+- `AutoStart` — HKCU Run 的 `Milkman` 键，仅路径变化时写入
 
 ## 已知坑（改动前必读）
 
@@ -46,3 +50,4 @@ powershell.exe -NoProfile -Command 'Start-Process "$env:LOCALAPPDATA\Milkman\Mil
 3. **wham/usage 响应坑**：`credits` 是对象（`{has_credits, balance}`）非数字；窗口标签按 `limit_window_seconds` 动态生成；服务端缺少 5h 时插入 `Unlimited` 占位并显示 `5h ∞`，真实 5h 恢复后自动替换
 4. **QA 闭环**：代码在 WSL 侧（UNC 供 csc 读取），运行/验收在 Windows 桌面（用户协作看浮窗截图）；改 UI 后让用户截图确认，切勿臆断视觉效果
 5. DeepSeekTimeline 的 `Main.cs`（`~/stable/DeepSeekTimeline`）是版式/交互的做法参照，不是本仓库文件
+6. **config.json 边界**：解析器只接受标准 JSON（单引号、无引号键会被拒绝）；`null` 数值字段回落默认值，`RefreshSeconds` ≤0 回落 60；解析失败会把原文件备份为 `config.json.bad` 并回落默认配置；`OpenCodeAccounts` 里的 null 元素会被忽略
