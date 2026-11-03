@@ -42,6 +42,12 @@ namespace Milkman
       return (long)(DateTime.UtcNow - new DateTime(1970, 1, 1)).TotalMilliseconds;
     }
 
+    // Codex auth.json 的 last_refresh 是 RFC3339 字符串（例: 2026-10-29T03:42:15.411646300Z）
+    public static string NowRfc3339()
+    {
+      return DateTime.UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss.fffffff", CultureInfo.InvariantCulture) + "00Z";
+    }
+
   }
 
   static class NativeMethods
@@ -291,7 +297,7 @@ namespace Milkman
         try
         {
           tokens["access_token"] = newAccess;
-          dict["last_refresh"] = Program.NowUnixMs() / 1000;
+          dict["last_refresh"] = Program.NowRfc3339();
           File.WriteAllText(authPath, Serialize(dict), new UTF8Encoding(false));
         }
         catch { /* 写回失败仅内存持有 */ }

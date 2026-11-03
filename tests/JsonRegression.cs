@@ -67,6 +67,10 @@ static class JsonRegression
         Check(Config.Parse("{\"RefreshSeconds\":-30}").RefreshSeconds==60,"negative refresh interval falls back to default");
         var nullAccounts=Config.Parse("{\"OpenCodeAccounts\":[null,{\"Name\":\"only\"}]}");
         Check(nullAccounts.OpenCodeAccounts.Count==1 && nullAccounts.OpenCodeAccounts[0].Name=="only","null account entries ignored");
+        string stampText=Program.NowRfc3339();
+        DateTimeOffset stamp;
+        Check(stampText.Length==30 && stampText.EndsWith("Z")
+          && DateTimeOffset.TryParse(stampText,CultureInfo.InvariantCulture,DateTimeStyles.RoundtripKind,out stamp),"last_refresh RFC3339 format");
         string config="{\"x\":42,\"Y\":-2160,\"DOCKED\":true,\"RefreshSeconds\":90,\"OpenCodeAccounts\":[{\"name\":\"测试🥛\",\"Key\":\"fixture-key\",\"AuthPath\":\"C:\\\\fixture\\\\auth.json\"}]}";
         var cfg=Config.Parse(config);
         Check(cfg.X==42 && cfg.Y==-2160 && cfg.Docked && cfg.RefreshSeconds==90,"config numbers and case insensitive fields");

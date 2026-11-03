@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Milkman — Windows 专用的单文件 WinForms 浮窗，显示 ChatGPT Plus（Plus/Pro 订阅额度）与 OpenCode Go（5h/周/月三窗口额度）的用量。目标是保持个人工具的单文件、零依赖和低维护成本；不要增加跨平台层、项目文件或第三方包。UI 以 DeepSeekTimeline（`~/stable/DeepSeekTimeline`）为视觉模板。
 
 数据源均为**官方/半官方 HTTP 端点**，无本地数据库依赖：
-- ChatGPT: `chatgpt.com/backend-api/wham/usage`（Bearer = `%USERPROFILE%\.codex\auth.json` 的 OAuth token；401 时经 `auth.openai.com/oauth/token` + client_id `app_EMoamEEZ73f0CkXaXp7hrann` 刷新并写回）
+- ChatGPT: `chatgpt.com/backend-api/wham/usage`（Bearer = `%USERPROFILE%\.codex\auth.json` 的 OAuth token；401 时经 `auth.openai.com/oauth/token` + client_id `app_EMoamEEZ73f0CkXaXp7hrann` 刷新并写回，`last_refresh` 保持 RFC3339 字符串）
 - OpenCode Go: `opencode.ai/zen/go/v1/usage`（Bearer = 账户的 `Key`（Console API key，OpenCode 2 用）；为空时回退到 OpenCode 1 `auth.json` 的 `opencode-go.key`；配置模型为 `OpenCodeAccounts` 列表，每项含 Name/Key/AuthPath）
 
 ## 常用命令
