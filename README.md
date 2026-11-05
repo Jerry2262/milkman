@@ -87,7 +87,7 @@ build.bat
 
 ## 维护
 
-- **换 Go key**：在 Console 重新创建后更新 `config.json` 里的 `Key`，下一轮刷新生效
+- **换 Go key**：在 Console 重新创建后更新 `config.json` 里的 `Key`，重启浮窗生效（配置只在启动时读取）
 - **换 Command Code key**：Studio 重新生成后更新 `CommandCode.Key`，重启浮窗生效
 - **OpenCode 1 用户**：把 `AuthPath` 指向 `auth.json` 即可，不需要 `Key`
 - **ChatGPT token**：过期后自动用 `refresh_token` 刷新并写回 `auth.json`
