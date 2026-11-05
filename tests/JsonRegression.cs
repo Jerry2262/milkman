@@ -95,6 +95,42 @@ static class JsonRegression
         }
         System.Threading.Tasks.Parallel.For(0,1000,delegate(int i) { var value=Read(auth); string encoded=Write(value); if(!encoded.Contains("9007199254740993")) throw new Exception("concurrent JSON state"); });
         Check(true,"parallel parser and writer isolation");
+
+        // Command Code：配置节三处同步（字段 / Parse / ToDictionary）与真实 credits 响应形状
+        Check(Config.Parse("{}").CommandCode==null,"command code absent");
+        Check(Config.Parse("{\"CommandCode\":null}").CommandCode==null,"command code null");
+        var ccConfig=Config.Parse("{\"CommandCode\":{\"name\":\"主账号\",\"key\":\"user_fixture\"}}");
+        Check(ccConfig.CommandCode!=null && ccConfig.CommandCode.Name=="主账号" && ccConfig.CommandCode.Key=="user_fixture","command code config");
+        var ccSaved=Config.Parse(Write(typeof(Config).GetMethod("ToDictionary", BindingFlags.NonPublic|BindingFlags.Instance).Invoke(ccConfig,null)));
+        Check(ccSaved.CommandCode!=null && ccSaved.CommandCode.Name=="主账号" && ccSaved.CommandCode.Key=="user_fixture","command code save roundtrip");
+        var parseCc=typeof(DataFetcher).GetMethod("ParseCommandCode", BindingFlags.NonPublic|BindingFlags.Instance);
+        var fetcher=new DataFetcher();
+        var ccLive=new CommandCodeSnapshot();
+        parseCc.Invoke(fetcher,new object[]{ccLive,
+          "{\"credits\":{\"belowThreshold\":false,\"monthlyCredits\":67.808776588,\"purchasedCredits\":0,\"freeCredits\":0},\"windowLimits\":{\"limited\":true,\"fiveHour\":{\"used\":2.191223412,\"cap\":14,\"resetAt\":1793881990707},\"weekly\":{\"used\":7.5,\"cap\":35,\"resetAt\":0}}}",
+          "{\"success\":true,\"data\":{\"planId\":\"individual-goat\",\"currentPeriodEnd\":\"2026-12-05T07:25:45.000Z\"}}"});
+        Check(ccLive.Windows[0]!=null && Math.Abs(ccLive.Windows[0].UsedPct-2.191223412/14)<1e-12 && Math.Abs(ccLive.Windows[0].ResetMs-1793881990707)<1,"command code 5h window");
+        Check(ccLive.Windows[1]!=null && ccLive.Windows[1].NotStarted && ccLive.Windows[1].ResetMs==0,"command code unopened weekly window");
+        Check(ccLive.Windows[2]!=null && Math.Abs(ccLive.Windows[2].UsedPct-(1-67.808776588/70))<1e-9 && ccLive.Windows[2].ResetMs>0,"command code monthly sized from plan grant");
+        var ccGrant=new CommandCodeSnapshot();
+        parseCc.Invoke(fetcher,new object[]{ccGrant,
+          "{\"credits\":{\"monthlyCredits\":25,\"monthlyCreditsGranted\":50},\"windowLimits\":{\"fiveHour\":{\"used\":0,\"cap\":14,\"resetAt\":0}}}",null});
+        Check(ccGrant.Windows[2]!=null && Math.Abs(ccGrant.Windows[2].UsedPct-0.5)<1e-12 && ccGrant.Windows[1]==null,"command code reported grant wins");
+        var ccSeconds=new CommandCodeSnapshot();
+        parseCc.Invoke(fetcher,new object[]{ccSeconds,
+          "{\"credits\":{\"monthlyCredits\":0},\"windowLimits\":{\"fiveHour\":{\"used\":1,\"cap\":4,\"resetAt\":1793881990}}}",null});
+        Check(ccSeconds.Windows[0]!=null && Math.Abs(ccSeconds.Windows[0].ResetMs-1793881990000)<1,"command code second-granularity resetAt");
+        var ccBare=new CommandCodeSnapshot();
+        parseCc.Invoke(fetcher,new object[]{ccBare,"{\"credits\":{\"monthlyCredits\":5}}",null});
+        Check(ccBare.Windows[0]==null && ccBare.Windows[1]==null && ccBare.Windows[2]==null,"command code degrades without limits or grant");
+        var ccPayg=new CommandCodeSnapshot();
+        parseCc.Invoke(fetcher,new object[]{ccPayg,"{\"credits\":{\"monthlyCredits\":10,\"monthlyCreditsGranted\":20},\"windowLimits\":{\"limited\":false}}",null});
+        Check(ccPayg.Windows[0]==null && ccPayg.Windows[1]==null && ccPayg.Windows[2]!=null,"command code pay-as-you-go hides rolling windows");
+        bool ccRejected=false;
+        try { parseCc.Invoke(fetcher,new object[]{new CommandCodeSnapshot(),"{\"error\":{\"code\":\"UNAUTHORIZED\"}}",null}); }
+        catch (TargetInvocationException) { ccRejected=true; }
+        Check(ccRejected,"command code rejects response without credits");
+
         Console.WriteLine("PASS " + checks + " JSON/config regression checks (synthetic data only)");
     }
 }

@@ -4,11 +4,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目概览
 
-Milkman — Windows 专用的单文件 WinForms 浮窗，显示 ChatGPT Plus（Plus/Pro 订阅额度）与 OpenCode Go（5h/周/月三窗口额度）的用量。目标是保持个人工具的单文件、零依赖和低维护成本；不要增加跨平台层、项目文件或第三方包。UI 以 DeepSeekTimeline（`~/stable/DeepSeekTimeline`）为视觉模板。
+Milkman — Windows 专用的单文件 WinForms 浮窗，显示 ChatGPT Plus（Plus/Pro 订阅额度）、OpenCode Go（5h/周/月三窗口额度）与 Command Code（GOAT 等套餐的 5h/周滚动窗口 + 月度 credits）的用量。目标是保持个人工具的单文件、零依赖和低维护成本；不要增加跨平台层、项目文件或第三方包。UI 以 DeepSeekTimeline（`~/stable/DeepSeekTimeline`）为视觉模板。
 
 数据源均为**官方/半官方 HTTP 端点**，无本地数据库依赖：
 - ChatGPT: `chatgpt.com/backend-api/wham/usage`（Bearer = `%USERPROFILE%\.codex\auth.json` 的 OAuth token；401 时经 `auth.openai.com/oauth/token` + client_id `app_EMoamEEZ73f0CkXaXp7hrann` 刷新并写回，`last_refresh` 保持 RFC3339 字符串）
 - OpenCode Go: `opencode.ai/zen/go/v1/usage`（Bearer = 账户的 `Key`（Console API key，OpenCode 2 用）；为空时回退到 OpenCode 1 `auth.json` 的 `opencode-go.key`；配置模型为 `OpenCodeAccounts` 列表，每项含 Name/Key/AuthPath）
+- Command Code: `api.commandcode.ai/alpha/billing/credits`（Bearer = `CommandCode.Key`，Studio → API keys 创建的 key，`user_` 开头；5h/周 = `windowLimits.fiveHour|weekly` 的 `used/cap`，`resetAt` 是 epoch 毫秒且 0 = 窗口尚未开始；月度 = `credits.monthlyCredits` 对比 `monthlyCreditsGranted`，该字段缺失时按 `/alpha/billing/subscriptions` 的 planId 查内置套餐表（GOAT=70），套餐信息取不到则月度条显示 `—`；月度重置时间取 subscriptions 的 `currentPeriodEnd`）
 
 ## 常用命令
 
@@ -32,12 +33,12 @@ powershell.exe -NoProfile -Command 'Start-Process "$env:LOCALAPPDATA\Milkman\Mil
 ## 架构（单文件 Main.cs，按 region 组织）
 
 - `Program` — 入口；TLS1.2 显式设置（.NET 4.x 默认不协商，必踩坑）；写自启注册表；`DataDir()` = `%LOCALAPPDATA%\Milkman`
-- `Config` — 显式字段映射读写 `config.json`（窗口 X/Y、Docked、RefreshSeconds、OpenCodeAccounts）；程序固定开机自启，不设配置开关；解析失败回落默认并备份 `config.json.bad`；新增字段需同步 `Parse()` / `ToDictionary()`，否则会静默读不到/存不住
-- `DataFetcher` — 无状态网络层；`FetchGpt()` 与每个 `FetchGo(account)` 可并行调用；JSON 字段统一安全读取，轻量 JSON 值树逐调用独立解析，不依赖 ASP.NET 或共享序列化器锁；错误消息截断 80 字
+- `Config` — 显式字段映射读写 `config.json`（窗口 X/Y、Docked、RefreshSeconds、OpenCodeAccounts、CommandCode）；程序固定开机自启，不设配置开关；解析失败回落默认并备份 `config.json.bad`；新增字段需同步 `Parse()` / `ToDictionary()`，否则会静默读不到/存不住
+- `DataFetcher` — 无状态网络层；`FetchGpt()`、每个 `FetchGo(account)` 与 `FetchCommandCode(cfg)` 可并行调用；JSON 字段统一安全读取，轻量 JSON 值树逐调用独立解析，不依赖 ASP.NET 或共享序列化器锁；错误消息截断 80 字
 - `MilkmanForm` — 自绘 UI + 行为：
-  - 版式：宽 520，无 OpenCode 账户（config 中 `OpenCodeAccounts` 留空 = 未订阅，整块隐藏）时高 92，单账户 168、每增加一个账户高度增加 76；ChatGPT 按实际窗口数分 1–3 段；Brush/Pen/BandPath 缓存复用，低频动态文本直接测量，禁止缓存不断变化的倒计时字符串
+  - 版式：宽 520，高度 = `16 + (行数 + 1) × GoRowH(76)`，行数 = OpenCode 账户数 +（配置了 `CommandCode` 则 +1）；`OpenCodeAccounts` 留空、`CommandCode` 为 null 都表示未订阅、对应区块隐藏；ChatGPT 按实际窗口数分 1–3 段；Brush/Pen/BandPath 缓存复用，低频动态文本直接测量，禁止缓存不断变化的倒计时字符串
   - 吸附：`WM_NCHITTEST`→`HTCAPTION` 系统级拖动；`WM_ENTERSIZEMOVE/EXITSIZEMOVE` 判定出入吸附（Top≤monTop+8 吸附，>monTop+30 脱离）；`DockTick` 30ms 缓出（dy/3，`Peek=5`）；双击 Pin 后立即展开并停止 DockTimer，取消 Pin 时恢复
-  - 独立刷新：一个低频 `_refreshTimer` 仅负责调度；ChatGPT 与各 Go 账户分别维护 busy/auto/error/last-success，失败只暂停自身并保留旧数据，点击对应重试按钮单独重试
+  - 独立刷新：一个低频 `_refreshTimer` 仅负责调度；ChatGPT、各 Go 账户与 Command Code 分别维护 busy/auto/error/last-success，失败只暂停自身并保留旧数据，点击对应重试按钮单独重试（`RetryHit` 用 `CcRetry=-3` 区分 Command Code 行）
   - 置顶：`TopMost=true` 只是 WinForms 期望状态，原生窗口可能被降级而属性仍为 true；`EnsureTopMost()` 在 `WM_WINDOWPOSCHANGED` / `WM_STYLECHANGED(GWL_EXSTYLE)` 与 `OnShown` 后检查 `WS_EX_TOPMOST`，丢失才补回（不轮询、不抢焦点）
   - 多屏：`monRect` 可能为负坐标屏（副屏在顶部），坐标计算要考虑
 - `Json` — 同文件内的标准 JSON 读写；保留未知授权字段的数字词法，避免装载 ASP.NET。改动 `Json` / `Config` / 响应解析后必须跑 `tests\run.bat`（仅合成数据）。
@@ -51,3 +52,4 @@ powershell.exe -NoProfile -Command 'Start-Process "$env:LOCALAPPDATA\Milkman\Mil
 4. **QA 闭环**：代码在 WSL 侧（UNC 供 csc 读取），运行/验收在 Windows 桌面（用户协作看浮窗截图）；改 UI 后让用户截图确认，切勿臆断视觉效果
 5. DeepSeekTimeline 的 `Main.cs`（`~/stable/DeepSeekTimeline`）是版式/交互的做法参照，不是本仓库文件
 6. **config.json 边界**：解析器只接受标准 JSON（单引号、无引号键会被拒绝）；`null` 数值字段回落默认值，`RefreshSeconds` ≤0 回落 60；解析失败会把原文件备份为 `config.json.bad` 并回落默认配置；`OpenCodeAccounts` 里的 null 元素会被忽略
+7. **Command Code 响应坑**：`windowLimits.*.resetAt` 是 epoch 毫秒、0 表示滚动窗口尚未开始（显示“未开始”）；`monthlyCredits` 是**剩余**不是已用；`monthlyCreditsGranted` 可能不返回，缺它时月度分母靠套餐表兜底（`individual-goat`=70），套餐也取不到就只在月度版位显示 `—`；`/alpha/*` 是 CLI 内部接口，字段随时可能变

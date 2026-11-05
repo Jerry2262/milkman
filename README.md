@@ -1,6 +1,6 @@
 # Milkman 🥛
 
-> ChatGPT Plus / OpenCode Go 用量浮窗 —— 不打开网页也能看到还剩多少额度
+> ChatGPT Plus / OpenCode Go / Command Code 用量浮窗 —— 不打开网页也能看到还剩多少额度
 
 ![界面预览](docs/screenshot.png)
 
@@ -10,9 +10,10 @@ Windows 专用的单文件 WinForms 常驻浮窗：无边框、半透明、屏�
 
 - **ChatGPT Plus**：按服务端返回的窗口（5h / 周 / 代码审查）分段展示；服务端暂时不返回 5h 时显示 `5h ∞`
 - **OpenCode Go**：支持多个账户；每个账户 5h / 周 / 月三条用量，账户级计数与其他设备一致
+- **Command Code（GOAT 等套餐）**：5h / 周两个滚动窗口加月度 credits；配置里没有这一段时整块隐藏
 - 屏幕顶部吸附 + 缓出动画 + 双击 Pin
 - 固定开机自启；窗口位置与吸附状态持久化
-- 独立刷新：ChatGPT 与每个 Go 账户互不等待；失败只暂停自身并保留旧数据，点对应“重试”恢复
+- 独立刷新：ChatGPT、每个 Go 账户与 Command Code 互不等待；失败只暂停自身并保留旧数据，点对应“重试”恢复
 - 原生置顶丢失后自动恢复，不抢前台焦点
 
 ## 数据源
@@ -21,6 +22,7 @@ Windows 专用的单文件 WinForms 常驻浮窗：无边框、半透明、屏�
 |---|---|---|
 | ChatGPT / Codex | `chatgpt.com/backend-api/wham/usage`（非官方） | `%USERPROFILE%\.codex\auth.json` 的 OAuth token，401 时自动刷新并写回 |
 | OpenCode Go | `opencode.ai/zen/go/v1/usage` | `OpenCodeAccounts[].Key`（Console API key）；回退 OpenCode 1 `auth.json` 里的 `opencode-go.key` |
+| Command Code（GOAT 等套餐） | `api.commandcode.ai/alpha/billing/credits`（CLI `/usage` 用的内部接口） | `CommandCode.Key`（Studio → API keys，`user_` 开头）；套餐与月度周期另取 `/alpha/billing/subscriptions` |
 
 ## 系统要求
 
@@ -57,7 +59,8 @@ build.bat
   "RefreshSeconds": 60,
   "OpenCodeAccounts": [
     { "Name": "个人", "Key": "oc_sk_...", "AuthPath": "" }
-  ]
+  ],
+  "CommandCode": { "Name": "主账号", "Key": "user_..." }
 }
 ```
 
@@ -66,6 +69,8 @@ build.bat
 - `Name`：显示名称
 - `Key`：OpenCode Go 的 API key（Console → Account › Personal API keys，`oc_sk_` 开头）。OpenCode 2 把凭据存进本地数据库、不再更新 `auth.json`，所以推荐直接填这里
 - `AuthPath`：OpenCode 1 的 `auth.json` 路径；`Key` 为空时从中读取 `opencode-go.key`
+- `CommandCode`：Command Code 订阅（GOAT / Pro 等）；整段删掉或写成 `null` 会隐藏该区块
+- `CommandCode.Key`：Studio → API keys 创建的 key（`user_` 开头），CLI 与 Provider API 同一把；`Name` 只是显示名
 - `X` / `Y` / `Docked`：窗口位置与吸附状态，由程序自动维护
 
 `config.json` 必须是标准 JSON：程序只接受标准语法，单引号、无引号键之类的宽松写法会被拒绝。解析失败时程序回落到默认配置，并把原文件备份为 `config.json.bad`，避免原配置被静默覆盖。
@@ -83,6 +88,7 @@ build.bat
 ## 维护
 
 - **换 Go key**：在 Console 重新创建后更新 `config.json` 里的 `Key`，下一轮刷新生效
+- **换 Command Code key**：Studio 重新生成后更新 `CommandCode.Key`，重启浮窗生效
 - **OpenCode 1 用户**：把 `AuthPath` 指向 `auth.json` 即可，不需要 `Key`
 - **ChatGPT token**：过期后自动用 `refresh_token` 刷新并写回 `auth.json`
 
@@ -102,6 +108,7 @@ tests\run.bat
 
 - `wham/usage` 是非官方端点，可能随 OpenAI 调整
 - OpenCode Go 用量接口没有公开文档，字段变化时可能需要适配
+- Command Code 的 `/alpha/*` 是 CLI 内部接口，同样没有公开文档；月度总量在服务端没返回 `monthlyCreditsGranted` 时按套餐表估算（GOAT = 70 credits），未知套餐的月度条显示 `—`
 - `config.json` 中的 key 为明文（与 OpenCode 1 的 `auth.json` 相同），不要提交到仓库或分享
 - 仅支持 Windows
 

@@ -1,8 +1,9 @@
-// Milkman — 榨取/剥削 ChatGPT Plus·OpenCode Go 等 coding plan 额度的用量浮窗
+// Milkman — 榨取/剥削 ChatGPT Plus·OpenCode Go·Command Code 等 coding plan 额度的用量浮窗
 // 参照 DeepSeekTimeline 的单文件 WinForms 模式：csc 编译，无 VS 工程。
 // 数据源(均为 HTTP, 无本地依赖):
 //   ChatGPT/Codex:  %USERPROFILE%\.codex\auth.json 的 OAuth token -> chatgpt.com/backend-api/wham/usage（非官方）
 //   OpenCode Go:    opencode-go.key -> https://opencode.ai/zen/go/v1/usage（官方账户级消费百分比）
+//   Command Code:   Studio API key -> https://api.commandcode.ai/alpha/billing/credits（CLI /usage 用的内部接口）
 using System;
 using System.Collections;
 using System.Collections.Generic;
@@ -90,6 +91,13 @@ namespace Milkman
     public string AuthPath = ""; // OpenCode 1 的 auth.json 路径（Key 为空时回退）
   }
 
+  // Command Code（GOAT / Pro 等套餐）：一把 Studio API key，没有订阅就不写这一段
+  class CommandCodeConfig
+  {
+    public string Name = "";
+    public string Key = "";      // Studio → API keys 创建的 key（user_ 开头），CLI 与 Provider API 同一把
+  }
+
   // 注意：新增配置字段时必须同时更新 Parse() 与 ToDictionary()，否则该字段会静默读不到/存不住。
   class Config
   {
@@ -97,6 +105,7 @@ namespace Milkman
     public bool Docked = false;
     public int RefreshSeconds = 60;
     public List<OpenCodeAccountConfig> OpenCodeAccounts = new List<OpenCodeAccountConfig>();
+    public CommandCodeConfig CommandCode; // null = 未订阅, 整块隐藏
 
     public static Config Load()
     {
@@ -163,6 +172,14 @@ namespace Milkman
         }
       }
       else cfg.OpenCodeAccounts = DefaultOpenCodeAccounts();
+      if (d.TryGetValue("CommandCode", out value) && value != null)
+      {
+        var entry = ConfigObject(value);
+        var cc = new CommandCodeConfig();
+        if (entry.TryGetValue("Name", out value)) cc.Name = value == null ? null : Convert.ToString(value, CultureInfo.InvariantCulture);
+        if (entry.TryGetValue("Key", out value)) cc.Key = value == null ? null : Convert.ToString(value, CultureInfo.InvariantCulture);
+        cfg.CommandCode = cc;
+      }
       return cfg;
     }
 
@@ -182,9 +199,12 @@ namespace Milkman
         accounts.Add(account == null ? null : new Dictionary<string, object> {
           { "Name", account.Name }, { "Key", account.Key }, { "AuthPath", account.AuthPath }
         });
+      object commandCode = CommandCode == null ? null : (object)new Dictionary<string, object> {
+        { "Name", CommandCode.Name }, { "Key", CommandCode.Key }
+      };
       return new Dictionary<string, object> {
         { "X", X }, { "Y", Y }, { "Docked", Docked }, { "RefreshSeconds", RefreshSeconds },
-        { "OpenCodeAccounts", accounts }
+        { "OpenCodeAccounts", accounts }, { "CommandCode", commandCode }
       };
     }
 
@@ -230,6 +250,13 @@ namespace Milkman
     public DateTime LastSuccess;
   }
 
+  class CommandCodeSnapshot
+  {
+    public UsageWindow[] Windows = new UsageWindow[3]; // 5h / 周 / 月
+    public string Error;
+    public DateTime LastSuccess;
+  }
+
   // =======================================================================
   // DataFetcher: 无状态取数；ChatGPT 与每个 OpenCode 账户可并行调用
   // =======================================================================
@@ -239,6 +266,8 @@ namespace Milkman
     const string TokenUrl = "https://auth.openai.com/oauth/token";
     const string CodexClientId = "app_EMoamEEZ73f0CkXaXp7hrann";
     const string GoUsageUrl = "https://opencode.ai/zen/go/v1/usage";
+    const string CcCreditsUrl = "https://api.commandcode.ai/alpha/billing/credits";
+    const string CcSubscriptionsUrl = "https://api.commandcode.ai/alpha/billing/subscriptions";
     // Cloudflare 1010: opencode.ai 按浏览器签名拦截, 需浏览器 UA
     const string BrowserUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 
@@ -449,6 +478,140 @@ namespace Milkman
       return g;
     }
 
+    // ---------------- Command Code (GOAT / Pro 等套餐) ----------------
+    // 官方 CLI 里 /usage 用的内部接口(未公开, 可能变动):
+    //   GET /alpha/billing/credits, Bearer = Studio API key
+    //   -> { credits: { monthlyCredits, purchasedCredits, freeCredits, monthlyCreditsGranted? },
+    //        windowLimits: { limited, fiveHour: { used, cap, resetAt }, weekly: { ... } } }
+    //   GET /alpha/billing/subscriptions -> 套餐 id 与账单周期(月度重置时间); 仅兜底, 失败不影响滚动窗口
+    // resetAt 是 epoch 毫秒(0 = 窗口未开始); 5h/周是滚动窗口, 从首次请求起算
+    public CommandCodeSnapshot FetchCommandCode(CommandCodeConfig cfg)
+    {
+      var snapshot = new CommandCodeSnapshot();
+      try
+      {
+        FetchCommandCodeCore(snapshot, cfg);
+        snapshot.LastSuccess = DateTime.Now;
+      }
+      catch (Exception e) { snapshot.Error = Short(e.Message); }
+      return snapshot;
+    }
+
+    void FetchCommandCodeCore(CommandCodeSnapshot snapshot, CommandCodeConfig cfg)
+    {
+      string key = (cfg.Key ?? "").Trim();
+      if (key.Length == 0) throw new Exception("未配置 Command Code key");
+
+      string body; int status;
+      HttpGetWithStatus(CcCreditsUrl, key, out body, out status);
+      if (status == 401) throw new Exception("Command Code key 被拒绝");
+      if (status == 403) throw new Exception("该 key 无 Command Code 权限");
+      if (status < 200 || status >= 300) throw new Exception("Command Code usage HTTP " + status);
+
+      // 订阅信息只提供月度分母(套餐表)与月度重置时间; 失败时这两项留空, 滚动窗口照常显示
+      string subscriptions = null;
+      try
+      {
+        int subsStatus;
+        HttpGetWithStatus(CcSubscriptionsUrl, key, out subscriptions, out subsStatus);
+        if (subsStatus < 200 || subsStatus >= 300) subscriptions = null;
+      }
+      catch { subscriptions = null; }
+
+      ParseCommandCode(snapshot, body, subscriptions);
+    }
+
+    void ParseCommandCode(CommandCodeSnapshot snapshot, string creditsBody, string subscriptionsBody)
+    {
+      var root = Deserialize(creditsBody) as Dictionary<string, object>;
+      var credits = Map(root, "credits");
+      if (credits == null) throw new Exception("Command Code 响应无法解析");
+
+      Dictionary<string, object> subscription = null;
+      if (subscriptionsBody != null && subscriptionsBody.Length > 0)
+        subscription = Map(Deserialize(subscriptionsBody) as Dictionary<string, object>, "data");
+      string planId = Text(subscription, "planId");
+      double periodEndMs = TimestampMs(Value(subscription, "currentPeriodEnd"));
+
+      var limits = Map(root, "windowLimits") ?? Map(credits, "windowLimits");
+      bool limited = true;
+      if (limits != null)
+      {
+        object limitedFlag = Value(limits, "limited");
+        if (limitedFlag is bool && !(bool)limitedFlag) limited = false;
+      }
+      snapshot.Windows[0] = limited ? ParseCcWindow(limits, "fiveHour", "5h") : null;
+      snapshot.Windows[1] = limited ? ParseCcWindow(limits, "weekly", "周") : null;
+      snapshot.Windows[2] = ParseCcMonthlyWindow(credits, planId, periodEndMs);
+    }
+
+    UsageWindow ParseCcWindow(Dictionary<string, object> limits, string key, string label)
+    {
+      var window = Map(limits, key);
+      if (window == null) return null;
+      object cap = Value(window, "cap");
+      if (cap == null) return null;
+      double capValue = ToDouble(cap);
+      if (capValue <= 0) return null;
+      var parsed = new UsageWindow { Label = label, UsedPct = ToDouble(Value(window, "used") ?? 0) / capValue };
+      parsed.ResetMs = TimestampMs(Value(window, "resetAt"));
+      if (parsed.ResetMs <= 0) parsed.NotStarted = true; // resetAt=0: 滚动窗口尚未开始
+      return parsed;
+    }
+
+    UsageWindow ParseCcMonthlyWindow(Dictionary<string, object> credits, string planId, double periodEndMs)
+    {
+      object remainingValue = Value(credits, "monthlyCredits");
+      if (remainingValue == null) return null;
+      double remaining = ToDouble(remainingValue);
+      double granted = ToDouble(Value(credits, "monthlyCreditsGranted") ?? 0);
+      if (granted <= 0) granted = PlanMonthlyCredits(planId);
+      if (granted <= 0) return null; // 分母未知时不编造上限, 该版位显示 “—”
+      double used = 1.0 - remaining / granted;
+      return new UsageWindow {
+        Label = "月",
+        UsedPct = used < 0 ? 0 : used,
+        ResetMs = periodEndMs
+      };
+    }
+
+    // CLI 内置套餐表的月度 credits（服务端没返回 monthlyCreditsGranted 时兜底；未知套餐返回 0）
+    static double PlanMonthlyCredits(string planId)
+    {
+      switch (planId)
+      {
+        case "individual-goat": return 70;
+        case "individual-pro": return 30;
+        case "individual-go": return 10;
+        case "individual-go-v1": return 10;
+        default: return 0;
+      }
+    }
+
+    // resetAt 是 epoch 毫秒（0 = 窗口未开始）; currentPeriodEnd 是 ISO8601; 秒级时间戳也兼容
+    static double TimestampMs(object value)
+    {
+      if (value == null) return 0;
+      var text = value as string;
+      if (text != null)
+      {
+        DateTimeOffset parsed;
+        if (!DateTimeOffset.TryParse(text, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out parsed)) return 0;
+        return (parsed.UtcDateTime - new DateTime(1970, 1, 1)).TotalMilliseconds;
+      }
+      double number = ToDouble(value);
+      if (number <= 0) return 0;
+      return number < 100000000000.0 ? number * 1000.0 : number;
+    }
+
+    static double ToDouble(object value)
+    {
+      var text = value as string;
+      if (text == null) return Convert.ToDouble(value, CultureInfo.InvariantCulture);
+      double parsed;
+      return double.TryParse(text.Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out parsed) ? parsed : 0;
+    }
+
     // ---------------- HTTP ----------------
     // 返回响应体；401/403 -> null；网络错误抛异常
     static string HttpGet(string url, string bearer)
@@ -569,6 +732,7 @@ namespace Milkman
       BrYellow = new SolidBrush(BarYellow);
       BrRed = new SolidBrush(BarRed);
       BrAccentOff = new SolidBrush(AccentOff);
+      BrAccentCc = new SolidBrush(AccentCc);
       for (int count = 1; count <= 3; count++)
         GptBandPaths[count - 1] = CreateBandPaths(BandTop1, count);
     }
@@ -577,7 +741,7 @@ namespace Milkman
     readonly Font fontBig, fontMid, fontTick;
     readonly Rectangle closeRect = new Rectangle(W - 26, 7, 15, 15);
     bool hoverClose;
-    const int NoRetry = -2, GptRetry = -1;
+    const int NoRetry = -2, GptRetry = -1, CcRetry = -3;
     int _hoverRetry = NoRetry;
 
     // 吸附与动画（参照 DeepSeekTimeline：WM_NCHITTEST 拖动 + 顶部吸附 + 缓出）
@@ -597,13 +761,17 @@ namespace Milkman
     GptFetchResult _gpt = new GptFetchResult();
     List<GoAccountSnapshot> _goAccounts = new List<GoAccountSnapshot>();
     string _goError;
+    CommandCodeConfig _ccConfig;
+    CommandCodeSnapshot _cc = new CommandCodeSnapshot();
     Timer _refreshTimer = new Timer();
     Timer _clockTimer = new Timer();
     bool _gptBusy, _gptAuto = true;
     bool[] _goBusy, _goAuto;
+    bool _ccBusy, _ccAuto = true;
     int _formH;
     int _goRowCount;
     GraphicsPath[][] _goBandPaths;
+    GraphicsPath[] _ccBandPaths;
 
     public MilkmanForm()
     {
@@ -616,10 +784,14 @@ namespace Milkman
       _goAuto = new bool[_cfg.OpenCodeAccounts.Count];
       for (int i = 0; i < _goAuto.Length; i++) _goAuto[i] = true;
       _goRowCount = _cfg.OpenCodeAccounts.Count; // 列表留空 = 未订阅, 整块隐藏
-      _formH = 16 + (_goRowCount + 1) * GoRowH;
+      _ccConfig = _cfg.CommandCode;              // 没写这一段 = 未订阅, 整块隐藏
+      int ccRows = _ccConfig != null ? 1 : 0;
+      _formH = 16 + (_goRowCount + 1 + ccRows) * GoRowH;
       _goBandPaths = new GraphicsPath[_goRowCount][];
       for (int row = 0; row < _goRowCount; row++)
         _goBandPaths[row] = CreateBandPaths(GoFirstRowY + row * GoRowH + GoBandOffset, 3);
+      if (_ccConfig != null)
+        _ccBandPaths = CreateBandPaths(CcRowY + GoBandOffset, 3);
 
       fontBig = new Font("Microsoft YaHei UI", 12f, FontStyle.Bold);
       fontMid = new Font("Microsoft YaHei UI", 9f, FontStyle.Regular);
@@ -699,6 +871,7 @@ namespace Milkman
       bool started = StartGptRefresh(manual);
       for (int i = 0; i < _cfg.OpenCodeAccounts.Count; i++)
         started = StartGoRefresh(i, manual) || started;
+      started = StartCcRefresh(manual) || started;
       if (started) Invalidate();
     }
 
@@ -752,6 +925,34 @@ namespace Milkman
       }
       else
         current.Error = result.Error; // 仅暂停本账户，其他账户继续刷新
+      Invalidate();
+    }
+
+    bool StartCcRefresh(bool manual)
+    {
+      if (_ccConfig == null || _ccBusy || (!manual && !_ccAuto)) return false;
+      _ccBusy = true;
+      CommandCodeConfig cfg = _ccConfig;
+      Task.Run(() =>
+      {
+        var result = _fetcher.FetchCommandCode(cfg);
+        try { BeginInvoke((Action)(() => ApplyCcResult(result))); } catch { }
+      });
+      return true;
+    }
+
+    void ApplyCcResult(CommandCodeSnapshot result)
+    {
+      _ccBusy = false;
+      _ccAuto = result.Error == null;
+      if (result.Error == null)
+      {
+        _cc.Windows = result.Windows;
+        _cc.LastSuccess = result.LastSuccess;
+        _cc.Error = null;
+      }
+      else
+        _cc.Error = result.Error; // 仅暂停 Command Code，其他来源继续刷新
       Invalidate();
     }
 
@@ -961,6 +1162,8 @@ namespace Milkman
     const float BoxW = W - 40f, Gap = 6f;
     static readonly Color AccentOff = Color.FromArgb(88, 143, 124);
     static readonly SolidBrush BrAccentOff;
+    static readonly Color AccentCc = Color.FromArgb(176, 136, 84);   // 暖棕: Command Code
+    static readonly SolidBrush BrAccentCc;
     // ChatGPT 按实际窗口数选择 1/2/3 段；OpenCode 固定三段。路径只创建一次。
     static readonly GraphicsPath[][] GptBandPaths = new GraphicsPath[3][];
 
@@ -989,6 +1192,9 @@ namespace Milkman
       return new Rectangle(W - 76, rowY + 1, 48, 22);
     }
 
+    // Command Code 区块的行位置: 紧跟最后一个 OpenCode 账户
+    int CcRowY { get { return GoFirstRowY + _goRowCount * GoRowH; } }
+
     int RetryHit(Point p)
     {
       if (_gpt.Error != null && !_gptBusy && RetryButtonRect(12).Contains(p))
@@ -996,12 +1202,16 @@ namespace Milkman
       for (int row = 0; row < _goAccounts.Count && row < _goBusy.Length; row++)
         if (_goAccounts[row].Error != null && !_goBusy[row] && RetryButtonRect(GoFirstRowY + row * GoRowH).Contains(p))
           return row;
+      if (_ccConfig != null && _cc.Error != null && !_ccBusy && RetryButtonRect(CcRowY).Contains(p))
+        return CcRetry;
       return NoRetry;
     }
 
     void RetryAt(int retry)
     {
-      bool started = retry == GptRetry ? StartGptRefresh(true) : StartGoRefresh(retry, true);
+      bool started = retry == GptRetry ? StartGptRefresh(true)
+        : retry == CcRetry ? StartCcRefresh(true)
+        : StartGoRefresh(retry, true);
       if (started)
       {
         _hoverRetry = NoRetry;
@@ -1116,6 +1326,17 @@ namespace Milkman
           account != null && error != null && !busy, _hoverRetry == row);
 
         DrawWindows(g, account != null ? account.Windows : null, _goBandPaths[row], bandY, error);
+      }
+
+      // ---- 最后一段: Command Code（GOAT / Pro 等套餐），未配置时不占版位 ----
+      if (_ccConfig != null)
+      {
+        string name = _ccConfig.Name;
+        string title = string.IsNullOrEmpty(name) ? "Command Code" : "Command Code · " + name;
+        DrawBlockHead(g, CcRowY, BrAccentCc, title,
+          SourceStatus(_ccBusy, _cc.Error, _cc.LastSuccess), _cc.Error != null, _ccBusy,
+          _cc.Error != null && !_ccBusy, _hoverRetry == CcRetry);
+        DrawWindows(g, _cc.Windows, _ccBandPaths, CcRowY + GoBandOffset, _cc.Error);
       }
 
       // ---- 关闭按钮 ----
