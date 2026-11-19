@@ -104,6 +104,8 @@ namespace Milkman
     public int X = -1, Y = -1;
     public bool Docked = false;
     public int RefreshSeconds = 60;
+    // 留空 = %USERPROFILE%\.codex\auth.json；填了只认填的那一份（可以指向 WSL 里的路径）
+    public string ChatGptAuthPath = "";
     public List<OpenCodeAccountConfig> OpenCodeAccounts = new List<OpenCodeAccountConfig>();
     public CommandCodeConfig CommandCode; // null = 未订阅, 整块隐藏
 
@@ -153,6 +155,8 @@ namespace Milkman
         cfg.RefreshSeconds = Convert.ToInt32(value, CultureInfo.InvariantCulture);
       // 0/负数会让 WinForms Timer 抛 ArgumentOutOfRangeException，直接回落默认间隔
       if (cfg.RefreshSeconds <= 0) cfg.RefreshSeconds = 60;
+      if (d.TryGetValue("ChatGptAuthPath", out value) && value != null)
+        cfg.ChatGptAuthPath = Convert.ToString(value, CultureInfo.InvariantCulture);
       if (d.TryGetValue("OpenCodeAccounts", out value))
       {
         if (value != null)
@@ -204,6 +208,7 @@ namespace Milkman
       };
       return new Dictionary<string, object> {
         { "X", X }, { "Y", Y }, { "Docked", Docked }, { "RefreshSeconds", RefreshSeconds },
+        { "ChatGptAuthPath", ChatGptAuthPath },
         { "OpenCodeAccounts", accounts }, { "CommandCode", commandCode }
       };
     }
@@ -271,12 +276,12 @@ namespace Milkman
     // Cloudflare 1010: opencode.ai 按浏览器签名拦截, 需浏览器 UA
     const string BrowserUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 
-    public GptFetchResult FetchGpt()
+    public GptFetchResult FetchGpt(string authPath)
     {
       var result = new GptFetchResult();
       try
       {
-        FetchGptCore(result);
+        FetchGptCore(result, authPath);
         result.LastSuccess = DateTime.Now;
       }
       catch (Exception e) { result.Error = Short(e.Message); }
@@ -309,9 +314,12 @@ namespace Milkman
     }
 
     // ---------------- ChatGPT ----------------
-    void FetchGptCore(GptFetchResult result)
+    void FetchGptCore(GptFetchResult result, string authPath)
     {
-      string authPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".codex", "auth.json");
+      // 留空走 Windows 侧默认位置；要读别处的 auth.json（例如 WSL 里的）就在配置里显式指定
+      if (string.IsNullOrEmpty(authPath))
+        authPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".codex", "auth.json");
+      if (!File.Exists(authPath)) throw new Exception("auth 文件不存在: " + authPath);
       var dict = Deserialize(File.ReadAllText(authPath)) as Dictionary<string, object>;
       var tokens = Map(dict, "tokens");
       string access = Text(tokens, "access_token");
@@ -322,32 +330,69 @@ namespace Milkman
       var resp = HttpGet(WhamUrl, access);
       if (resp == null)
       {
-        string newAccess = RefreshAccessToken(refreshToken);
+        TokenRefresh refreshed = RefreshAccessToken(refreshToken);
         try
         {
-          tokens["access_token"] = newAccess;
+          ApplyRefresh(tokens, refreshed);
           dict["last_refresh"] = Program.NowRfc3339();
           File.WriteAllText(authPath, Serialize(dict), new UTF8Encoding(false));
         }
         catch { /* 写回失败仅内存持有 */ }
-        access = newAccess;
+        access = refreshed.Access;
         resp = HttpGet(WhamUrl, access);
         if (resp == null) throw new Exception("wham/usage 刷新后仍拒绝");
       }
       ParseWham(result, resp);
     }
 
-    string RefreshAccessToken(string refreshToken)
+    // 刷新响应里的 token 是成对轮换的：refresh_token 一次性，服务端换发新的一枚。
+    // 只写回 access_token 会把作废的 refresh_token 留在 auth.json 里，下次刷新被 reused 拒绝。
+    sealed class TokenRefresh
+    {
+      public string Access = "";
+      public string Refresh = "";
+      public string IdToken = "";
+    }
+
+    TokenRefresh RefreshAccessToken(string refreshToken)
     {
       var body = "client_id=" + CodexClientId + "&grant_type=refresh_token&refresh_token=" + Uri.EscapeDataString(refreshToken);
-      var resp = HttpPostForm(TokenUrl, body);
-      var d = Deserialize(resp) as Dictionary<string, object>;
-      // mac 版参考: 刷新可能返回 refresh_token_expired / reused / invalidated 等错误码
-      string error = Text(d, "error");
-      if (error.Length > 0) throw new Exception("token 刷新失败: " + error);
-      string at = Text(d, "access_token");
-      if (string.IsNullOrEmpty(at)) throw new Exception("token 刷新失败");
-      return at;
+      return ParseRefresh(HttpPostForm(TokenUrl, body));
+    }
+
+    static TokenRefresh ParseRefresh(string text)
+    {
+      // 非 JSON（例如 Cloudflare 拦截页）也归到解析失败，不把语法制式异常抛给 UI
+      Dictionary<string, object> d = null;
+      try { d = Deserialize(text) as Dictionary<string, object>; }
+      catch { }
+      if (d == null) throw new Exception("刷新失败: 响应无法解析");
+      // 刷新可能返回 refresh_token_expired / reused / invalidated 等错误码
+      string error = RefreshError(d);
+      if (error.Length > 0) throw new Exception("刷新失败: " + error);
+      var refreshed = new TokenRefresh();
+      refreshed.Access = Text(d, "access_token");
+      refreshed.Refresh = Text(d, "refresh_token");
+      refreshed.IdToken = Text(d, "id_token");
+      if (string.IsNullOrEmpty(refreshed.Access)) throw new Exception("刷新失败: 响应无 access_token");
+      return refreshed;
+    }
+
+    // error 可能是字符串，也可能是 {code, message} 对象（reused/expired 都在 code 里）
+    static string RefreshError(Dictionary<string, object> d)
+    {
+      var detail = Map(d, "error");
+      if (detail == null) return Text(d, "error");
+      string code = Text(detail, "code");
+      return code.Length > 0 ? code : Text(detail, "message");
+    }
+
+    // 只覆盖响应里确实带回来的字段，缺省的保持原值
+    static void ApplyRefresh(Dictionary<string, object> tokens, TokenRefresh refreshed)
+    {
+      tokens["access_token"] = refreshed.Access;
+      if (!string.IsNullOrEmpty(refreshed.Refresh)) tokens["refresh_token"] = refreshed.Refresh;
+      if (!string.IsNullOrEmpty(refreshed.IdToken)) tokens["id_token"] = refreshed.IdToken;
     }
 
     void ParseWham(GptFetchResult result, string resp)
@@ -662,6 +707,7 @@ namespace Milkman
       }
     }
 
+    // 返回响应体；4xx/5xx 也返回 body（刷新失败的错误码在 body 里），网络错误抛异常
     static string HttpPostForm(string url, string body)
     {
       var req = CreateRequest(url, "POST", null);
@@ -669,10 +715,21 @@ namespace Milkman
       var bytes = Encoding.UTF8.GetBytes(body);
       req.ContentLength = bytes.Length;
       using (var s = req.GetRequestStream()) s.Write(bytes, 0, bytes.Length);
-      using (var resp = (HttpWebResponse)req.GetResponse())
-      using (var s = resp.GetResponseStream())
-      using (var r = new StreamReader(s))
-        return r.ReadToEnd();
+      try
+      {
+        using (var resp = (HttpWebResponse)req.GetResponse())
+        using (var s = resp.GetResponseStream())
+        using (var r = new StreamReader(s))
+          return r.ReadToEnd();
+      }
+      catch (WebException e)
+      {
+        var resp = e.Response as HttpWebResponse;
+        if (resp == null) throw new Exception("HTTP " + e.Message);
+        using (var s = resp.GetResponseStream())
+        using (var r = new StreamReader(s))
+          return r.ReadToEnd();
+      }
     }
   }
 
@@ -881,7 +938,7 @@ namespace Milkman
       _gptBusy = true;
       Task.Run(() =>
       {
-        var result = _fetcher.FetchGpt();
+        var result = _fetcher.FetchGpt(_cfg.ChatGptAuthPath);
         try { BeginInvoke((Action)(() => ApplyGptResult(result))); } catch { }
       });
       return true;
@@ -964,6 +1021,9 @@ namespace Milkman
       {
         CreateParams cp = base.CreateParams;
         cp.ExStyle |= 0x00000080; // WS_EX_TOOLWINDOW
+        // WinForms 的 TopMost 是创建后调 SetWindowPos 补设的，后台启动（如开机自启）时会被前台锁忽略；
+        // 创建参数里直接带上 WS_EX_TOPMOST 才是创建即置顶，与是否前台无关。
+        if (TopMost) cp.ExStyle |= 0x00000008; // WS_EX_TOPMOST
         return cp;
       }
     }
@@ -1223,8 +1283,22 @@ namespace Milkman
     string SourceStatus(bool busy, string error, DateTime lastSuccess)
     {
       if (busy) return error != null ? "正在重试…" : lastSuccess == default(DateTime) ? "正在获取…" : "正在刷新…";
-      if (error != null) return "无法获取信息";
+      if (error != null) return error;
       return lastSuccess == default(DateTime) ? "" : "更新于 " + lastSuccess.ToString("HH:mm:ss");
+    }
+
+    // 按像素宽度截断，超出时以省略号收尾
+    static string Fit(Graphics g, string text, Font font, float max)
+    {
+      if (g.MeasureString(text, font).Width <= max) return text;
+      int low = 0, high = text.Length;
+      while (low < high)
+      {
+        int mid = (low + high + 1) / 2;
+        if (g.MeasureString(text.Substring(0, mid) + "…", font).Width <= max) low = mid;
+        else high = mid - 1;
+      }
+      return text.Substring(0, low) + "…";
     }
 
     void DrawBlockHead(Graphics g, int rowY, SolidBrush dot, string title, string status, bool error, bool busy, bool retry, bool hoverRetry)
@@ -1235,6 +1309,9 @@ namespace Milkman
       {
         SolidBrush brush = error && !busy ? BrRed : busy ? BrSub : BrFaint;
         int right = retry ? RetryButtonRect(rowY).Left - 8 : W - 20;
+        float room = right - 40 - Wd(g, title, fontBig) - 8;
+        // 放不下的错误长文退回落款，完整原因由空数据行承担，避免标题行出现半截文字
+        if (error && !busy && Wd(g, status, fontMid) > room) status = "无法获取信息";
         g.DrawString(status, fontMid, brush, right - Wd(g, status, fontMid), rowY + 3);
       }
       if (retry)
@@ -1287,8 +1364,11 @@ namespace Milkman
             window.Unlimited ? ""
               : window.NotStarted ? "未开始"
               : window.ResetMs > 0 ? "重置 " + FormatRemaining(window.ResetMs) : "");
+        else if (error == null)
+          g.DrawString("—", fontTick, BrSub, x, bandY + BandH + 8);
         else
-          g.DrawString(error != null ? "⚠ 无数据" : "—", fontTick, error != null ? BrRed : BrSub,
+          // 首段显示具体原因，其余段保持占位文案
+          g.DrawString(i == 0 ? "⚠ " + Fit(g, error, fontTick, width - 10) : "⚠ 无数据", fontTick, BrRed,
             x, bandY + BandH + 8);
       }
     }

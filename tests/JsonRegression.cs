@@ -45,6 +45,23 @@ static class JsonRegression
         parse.Invoke(new DataFetcher(), new object[]{result,"{\"rate_limit\":{\"primary_window\":{\"limit_window_seconds\":604800,\"used_percent\":42.5,\"reset_at\":1900000000}},\"credits\":{\"has_credits\":false,\"balance\":null}}"});
         Check(result.Windows.Count==2 && result.Windows[0].Label=="5h" && result.Windows[0].Unlimited, "preserve 5h placeholder");
         Check(result.Windows[1].Label=="周" && Math.Abs(result.Windows[1].UsedPct-.425)<.000001, "parse GPT usage");
+        // 刷新响应里的 token 成对轮换：refresh_token/id_token 必须一起写回，否则下次刷新被 reused 拒绝
+        var parseRefresh=typeof(DataFetcher).GetMethod("ParseRefresh", Private);
+        var applyRefresh=typeof(DataFetcher).GetMethod("ApplyRefresh", Private);
+        var stored=Map(Map(Read("{\"tokens\":{\"access_token\":\"at1\",\"refresh_token\":\"rt1\",\"id_token\":\"idt1\",\"account_id\":\"acc\"},\"OPENAI_API_KEY\":null}"))["tokens"]);
+        applyRefresh.Invoke(null,new object[]{stored,parseRefresh.Invoke(null,new object[]{"{\"access_token\":\"at2\",\"refresh_token\":\"rt2\",\"id_token\":\"idt2\",\"expires_in\":3600}"})});
+        Check((string)stored["access_token"]=="at2" && (string)stored["refresh_token"]=="rt2" && (string)stored["id_token"]=="idt2","persist rotated refresh token");
+        Check((string)stored["account_id"]=="acc","keep unrelated token fields");
+        applyRefresh.Invoke(null,new object[]{stored,parseRefresh.Invoke(null,new object[]{"{\"access_token\":\"at3\"}"})});
+        Check((string)stored["refresh_token"]=="rt2" && (string)stored["id_token"]=="idt2","keep rotated tokens when response omits them");
+        string reused="";
+        try { parseRefresh.Invoke(null,new object[]{"{\"error\":{\"message\":\"used\",\"type\":\"invalid_request_error\",\"code\":\"refresh_token_reused\"}}"}); }
+        catch (TargetInvocationException e) { reused=e.InnerException.Message; }
+        Check(reused=="刷新失败: refresh_token_reused","refresh error code surfaces");
+        foreach (string bad in new[] { "{\"error\":\"refresh_token_expired\"}", "not json", "{\"error\":{}}", "{\"access_token\":\"\"}" }) {
+            bool rejected=false; try { parseRefresh.Invoke(null,new object[]{bad}); } catch (TargetInvocationException) { rejected=true; }
+            Check(rejected,"reject unusable refresh response: " + bad);
+        }
         foreach (string invalid in new[] { "", " ", "undefined", "NaN", "Infinity", "+1", "01", "-01", "1.", ".1", "1e", "1e+", "[1,]", "{\"a\":1,}", "[true false]", "{a:1}", "{}x", "\"\\x20\"", "\"\\u12xz\"", "\"a\nb\"" }) {
             bool rejected=false; try { Read(invalid); } catch { rejected=true; }
             Check(rejected,"reject malformed JSON");
@@ -71,13 +88,16 @@ static class JsonRegression
         DateTimeOffset stamp;
         Check(stampText.Length==30 && stampText.EndsWith("Z")
           && DateTimeOffset.TryParse(stampText,CultureInfo.InvariantCulture,DateTimeStyles.RoundtripKind,out stamp),"last_refresh RFC3339 format");
-        string config="{\"x\":42,\"Y\":-2160,\"DOCKED\":true,\"RefreshSeconds\":90,\"OpenCodeAccounts\":[{\"name\":\"测试🥛\",\"Key\":\"fixture-key\",\"AuthPath\":\"C:\\\\fixture\\\\auth.json\"}]}";
+        string config="{\"x\":42,\"Y\":-2160,\"DOCKED\":true,\"RefreshSeconds\":90,\"ChatGptAuthPath\":\"C:\\\\fixture\\\\codex\\\\auth.json\",\"OpenCodeAccounts\":[{\"name\":\"测试🥛\",\"Key\":\"fixture-key\",\"AuthPath\":\"C:\\\\fixture\\\\auth.json\"}]}";
         var cfg=Config.Parse(config);
         Check(cfg.X==42 && cfg.Y==-2160 && cfg.Docked && cfg.RefreshSeconds==90,"config numbers and case insensitive fields");
+        Check(cfg.ChatGptAuthPath=="C:\\fixture\\codex\\auth.json","chatgpt auth path");
+        Check(Config.Parse("{}").ChatGptAuthPath=="","chatgpt auth path defaults to empty");
         Check(cfg.OpenCodeAccounts.Count==1 && cfg.OpenCodeAccounts[0].Name=="测试🥛" && cfg.OpenCodeAccounts[0].Key=="fixture-key","account fields");
         var dictionary=typeof(Config).GetMethod("ToDictionary", BindingFlags.NonPublic|BindingFlags.Instance).Invoke(cfg,null);
         var saved=Config.Parse(Write(dictionary));
         Check(saved.X==cfg.X && saved.Y==cfg.Y && saved.OpenCodeAccounts[0].AuthPath==cfg.OpenCodeAccounts[0].AuthPath,"config save roundtrip");
+        Check(saved.ChatGptAuthPath==cfg.ChatGptAuthPath,"chatgpt auth path roundtrip");
         bool depthRejected=false;
         try { Read(new string('[',102)+"0"+new string(']',102)); } catch { depthRejected=true; }
         Check(depthRejected,"JSON depth limit");

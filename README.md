@@ -57,6 +57,7 @@ build.bat
   "Y": -2160,
   "Docked": true,
   "RefreshSeconds": 60,
+  "ChatGptAuthPath": "",
   "OpenCodeAccounts": [
     { "Name": "个人", "Key": "oc_sk_...", "AuthPath": "" }
   ],
@@ -65,6 +66,7 @@ build.bat
 ```
 
 - `RefreshSeconds`：刷新间隔，默认 60 秒
+- `ChatGptAuthPath`：ChatGPT/Codex 的 `auth.json` 路径；留空用 `%USERPROFILE%\.codex\auth.json`，填了只认填的那一份（可以指向 WSL 的路径，例如 `\\wsl.localhost\<发行版>\home\<用户>\.codex\auth.json`）
 - `OpenCodeAccounts`：账户列表，每项在浮窗中占一行；留空数组 `[]` 会隐藏 OpenCode Go 区块
 - `Name`：显示名称
 - `Key`：OpenCode Go 的 API key（Console → Account › Personal API keys，`oc_sk_` 开头）。OpenCode 2 把凭据存进本地数据库、不再更新 `auth.json`，所以推荐直接填这里
@@ -90,7 +92,8 @@ build.bat
 - **换 Go key**：在 Console 重新创建后更新 `config.json` 里的 `Key`，重启浮窗生效（配置只在启动时读取）
 - **换 Command Code key**：Studio 重新生成后更新 `CommandCode.Key`，重启浮窗生效
 - **OpenCode 1 用户**：把 `AuthPath` 指向 `auth.json` 即可，不需要 `Key`
-- **ChatGPT token**：过期后自动用 `refresh_token` 刷新并写回 `auth.json`
+- **ChatGPT token**：过期后自动用 `refresh_token` 刷新，并把服务端轮换出的 `access_token` / `refresh_token` / `id_token` 一并写回 `ChatGptAuthPath` 指向的那份文件（`refresh_token` 一次性，不写回新的一枚会让文件里的凭证失效）
+- **重新登录**：显示 `刷新失败: refresh_token_reused` 说明这份 `auth.json` 里的 `refresh_token` 已被用掉，只能用 Codex CLI 重新登录（`codex login`）生成新凭证；多台机器别共用同一份 `auth.json`，否则谁先刷新谁就把对方顶掉
 
 ## 启动开销与回归检查
 
