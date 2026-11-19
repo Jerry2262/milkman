@@ -8,7 +8,7 @@ Windows 专用的单文件 WinForms 常驻浮窗：无边框、半透明、屏�
 
 ## 功能
 
-- **ChatGPT Plus**：按服务端返回的窗口（5h / 周 / 代码审查）分段展示；服务端暂时不返回 5h 时显示 `5h ∞`
+- **ChatGPT Plus**：按服务端返回的窗口（5h / 周 / 代码审查）分段展示；成功响应有其他额度窗口但暂时缺少 5h 时显示 `5h ∞`
 - **OpenCode Go**：支持多个账户；每个账户 5h / 周 / 月三条用量，账户级计数与其他设备一致
 - **Command Code（GOAT 等套餐）**：5h / 周两个滚动窗口加月度 credits；配置里没有这一段时整块隐藏
 - 屏幕顶部吸附 + 缓出动画 + 双击 Pin
@@ -65,7 +65,7 @@ build.bat
 }
 ```
 
-- `RefreshSeconds`：刷新间隔，默认 60 秒
+- `RefreshSeconds`：刷新间隔，默认 60 秒；非正值或无法换算为计时器毫秒值的间隔回落到默认值
 - `ChatGptAuthPath`：ChatGPT/Codex 的 `auth.json` 路径；留空用 `%USERPROFILE%\.codex\auth.json`，填了只认填的那一份（可以指向 WSL 的路径，例如 `\\wsl.localhost\<发行版>\home\<用户>\.codex\auth.json`）
 - `OpenCodeAccounts`：账户列表，每项在浮窗中占一行；留空数组 `[]` 会隐藏 OpenCode Go 区块
 - `Name`：显示名称
@@ -92,7 +92,7 @@ build.bat
 - **换 Go key**：在 Console 重新创建后更新 `config.json` 里的 `Key`，重启浮窗生效（配置只在启动时读取）
 - **换 Command Code key**：Studio 重新生成后更新 `CommandCode.Key`，重启浮窗生效
 - **OpenCode 1 用户**：把 `AuthPath` 指向 `auth.json` 即可，不需要 `Key`
-- **ChatGPT token**：过期后自动用 `refresh_token` 刷新，并把服务端轮换出的 `access_token` / `refresh_token` / `id_token` 一并写回 `ChatGptAuthPath` 指向的那份文件（`refresh_token` 一次性，不写回新的一枚会让文件里的凭证失效）
+- **ChatGPT token**：收到 401 后先重读同一份凭据，优先使用已更新的令牌；仍需刷新时，轮换出的令牌通过同目录私有临时文件替换原文件。使用 WSL 路径时，浮窗会调用对应发行版设置临时文件权限。与 Codex CLI 共用凭据时，两者同时向服务端刷新仍可能冲突
 - **重新登录**：显示 `刷新失败: refresh_token_reused` 说明这份 `auth.json` 里的 `refresh_token` 已被用掉，只能用 Codex CLI 重新登录（`codex login`）生成新凭证；多台机器别共用同一份 `auth.json`，否则谁先刷新谁就把对方顶掉
 
 ## 启动开销与回归检查

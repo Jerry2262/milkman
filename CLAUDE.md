@@ -48,9 +48,9 @@ powershell.exe -NoProfile -Command 'Start-Process "$env:LOCALAPPDATA\Milkman\Mil
 
 1. **编译**：`/out` 不支持 UNC 路径（必须输出到 Windows 本地）；输出目录需先存在；源码是无 BOM 的 UTF-8，编译需 `/codepage:65001`；只支持 C#5 语法（无 `?.`、字符串插值等）和 .NET4.x API（无 `ToUnixTimeSeconds`）
 2. **Cloudflare 1010**：`opencode.ai` 按浏览器签名拦截，`BrowserUA` 是必需项
-3. **wham/usage 响应坑**：`credits` 是对象（`{has_credits, balance}`）非数字；窗口标签按 `limit_window_seconds` 动态生成；服务端缺少 5h 时插入 `Unlimited` 占位并显示 `5h ∞`，真实 5h 恢复后自动替换
+3. **wham/usage 响应坑**：`credits` 是对象（`{has_credits, balance}`）非数字；窗口标签按 `limit_window_seconds` 动态生成；成功响应已有其他可用额度窗口但缺少 5h 时插入 `Unlimited` 占位并显示 `5h ∞`，真实 5h 恢复后自动替换
 4. **QA 闭环**：代码在 WSL 侧（UNC 供 csc 读取），运行/验收在 Windows 桌面（用户协作看浮窗截图）；改 UI 后让用户截图确认，切勿臆断视觉效果
 5. DeepSeekTimeline 的 `Main.cs`（`~/stable/DeepSeekTimeline`）是版式/交互的做法参照，不是本仓库文件
-6. **config.json 边界**：解析器只接受标准 JSON（单引号、无引号键会被拒绝）；`null` 数值字段回落默认值，`RefreshSeconds` ≤0 回落 60；解析失败会把原文件备份为 `config.json.bad` 并回落默认配置；`OpenCodeAccounts` 里的 null 元素会被忽略
+6. **config.json 边界**：解析器只接受标准 JSON（单引号、无引号键会被拒绝）；`null` 数值字段回落默认值，`RefreshSeconds` ≤0 或换算为毫秒会溢出时回落 60；解析失败会把原文件备份为 `config.json.bad` 并回落默认配置；`OpenCodeAccounts` 里的 null 元素会被忽略
 7. **Command Code 响应坑**：`windowLimits.*.resetAt` 是 epoch 毫秒、0 表示滚动窗口尚未开始（显示“未开始”）；`monthlyCredits` 是**剩余**不是已用；`monthlyCreditsGranted` 可能不返回，缺它时月度分母靠套餐表兜底（`individual-goat`=70），套餐也取不到就只在月度版位显示 `—`；`/alpha/*` 是 CLI 内部接口，字段随时可能变
 8. **refresh_token 一次性**：`oauth/token` 每刷新一次就换发新的 `refresh_token` 并作废旧的，响应里的 `refresh_token` / `id_token` 必须和 `access_token` 一起写回。只写 `access_token` 会让文件里的 RT 变成废的，且症状要等 access_token 到期（约 10 天）才出现——表现为 `刷新失败: refresh_token_reused`，只能重新登录。多台机器也别共用同一份 `auth.json`

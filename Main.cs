@@ -79,6 +79,9 @@ namespace Milkman
 
     [System.Runtime.InteropServices.DllImport("user32.dll")]
     public static extern int GetWindowLong(IntPtr hWnd, int index);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
+    public static extern bool MoveFileEx(string source, string target, int flags);
   }
 
   // =======================================================================
@@ -152,9 +155,12 @@ namespace Milkman
       if (d.TryGetValue("Y", out value) && value != null) cfg.Y = Convert.ToInt32(value, CultureInfo.InvariantCulture);
       if (d.TryGetValue("Docked", out value) && value != null) cfg.Docked = Convert.ToBoolean(value, CultureInfo.InvariantCulture);
       if (d.TryGetValue("RefreshSeconds", out value) && value != null)
-        cfg.RefreshSeconds = Convert.ToInt32(value, CultureInfo.InvariantCulture);
-      // 0/负数会让 WinForms Timer 抛 ArgumentOutOfRangeException，直接回落默认间隔
-      if (cfg.RefreshSeconds <= 0) cfg.RefreshSeconds = 60;
+      {
+        try { cfg.RefreshSeconds = Convert.ToInt32(value, CultureInfo.InvariantCulture); }
+        catch (OverflowException) { } // 保留本字段默认值与其他配置。
+      }
+      // WinForms Timer 使用 int 毫秒；非正值或换算后溢出的秒数回落默认间隔。
+      if (cfg.RefreshSeconds <= 0 || cfg.RefreshSeconds > int.MaxValue / 1000) cfg.RefreshSeconds = 60;
       if (d.TryGetValue("ChatGptAuthPath", out value) && value != null)
         cfg.ChatGptAuthPath = Convert.ToString(value, CultureInfo.InvariantCulture);
       if (d.TryGetValue("OpenCodeAccounts", out value))
@@ -281,7 +287,7 @@ namespace Milkman
       var result = new GptFetchResult();
       try
       {
-        FetchGptCore(result, authPath);
+        FetchGptCore(result, authPath, GetWhamUsage, RequestTokenRefresh);
         result.LastSuccess = DateTime.Now;
       }
       catch (Exception e) { result.Error = Short(e.Message); }
@@ -314,35 +320,123 @@ namespace Milkman
     }
 
     // ---------------- ChatGPT ----------------
-    void FetchGptCore(GptFetchResult result, string authPath)
+    void FetchGptCore(GptFetchResult result, string authPath,
+      Func<string, string> getUsage, Func<string, string> requestRefresh)
     {
-      // 留空走 Windows 侧默认位置；要读别处的 auth.json（例如 WSL 里的）就在配置里显式指定
+      // 留空走 Windows 侧默认位置；显式路径不回退到其他凭据。
       if (string.IsNullOrEmpty(authPath))
         authPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".codex", "auth.json");
       if (!File.Exists(authPath)) throw new Exception("auth 文件不存在: " + authPath);
-      var dict = Deserialize(File.ReadAllText(authPath)) as Dictionary<string, object>;
-      var tokens = Map(dict, "tokens");
-      string access = Text(tokens, "access_token");
-      string refreshToken = Text(tokens, "refresh_token");
-      if (string.IsNullOrEmpty(access))
-        throw new Exception("codex auth.json 无 access_token");
-
-      var resp = HttpGet(WhamUrl, access);
+      authPath = Path.GetFullPath(authPath);
+      string access = ReadAccessToken(File.ReadAllText(authPath, Encoding.UTF8));
+      string resp = getUsage(access);
       if (resp == null)
       {
-        TokenRefresh refreshed = RefreshAccessToken(refreshToken);
-        try
+        // CLI 可能已在首次请求期间刷新；先复用磁盘里的新 access token。
+        string current = File.ReadAllText(authPath, Encoding.UTF8);
+        string latest = ReadAccessToken(current);
+        if (latest != access) resp = getUsage(latest);
+        if (resp == null)
         {
-          ApplyRefresh(tokens, refreshed);
-          dict["last_refresh"] = Program.NowRfc3339();
-          File.WriteAllText(authPath, Serialize(dict), new UTF8Encoding(false));
+          string refreshed = RefreshGptFile(authPath, current, requestRefresh);
+          resp = getUsage(refreshed);
+          if (resp == null) throw new Exception("wham/usage 刷新后仍拒绝");
         }
-        catch { /* 写回失败仅内存持有 */ }
-        access = refreshed.Access;
-        resp = HttpGet(WhamUrl, access);
-        if (resp == null) throw new Exception("wham/usage 刷新后仍拒绝");
       }
       ParseWham(result, resp);
+    }
+
+    static string ReadAccessToken(string json)
+    {
+      var dict = Deserialize(json) as Dictionary<string, object>;
+      string access = Text(Map(dict, "tokens"), "access_token");
+      if (access.Length == 0) throw new Exception("codex auth.json 无 access_token");
+      return access;
+    }
+
+    static string RefreshGptFile(string authPath, string current, Func<string, string> requestRefresh)
+    {
+      var dict = Deserialize(current) as Dictionary<string, object>;
+      var tokens = Map(dict, "tokens");
+      string refresh = Text(tokens, "refresh_token");
+      if (refresh.Length == 0) throw new Exception("codex auth.json 无 refresh_token");
+      string temp = Path.Combine(Path.GetDirectoryName(authPath), ".milkman-auth-" + Guid.NewGuid().ToString("N") + ".tmp");
+      bool wsl = temp.StartsWith(@"\\wsl.localhost\", StringComparison.OrdinalIgnoreCase)
+        || temp.StartsWith(@"\\wsl$\", StringComparison.OrdinalIgnoreCase);
+      try
+      {
+        // 先确认能创建私有暂存文件，再消耗一次性 refresh_token。
+        PrepareAuthFile(temp, wsl);
+        CheckAuthUnchanged(authPath, current);
+        TokenRefresh refreshed = ParseRefresh(requestRefresh(refresh));
+        ApplyRefresh(tokens, refreshed);
+        dict["last_refresh"] = Program.NowRfc3339();
+        using (var file = new FileStream(temp, FileMode.Open, FileAccess.Write, FileShare.None))
+        {
+          byte[] bytes = Encoding.UTF8.GetBytes(Serialize(dict));
+          file.Write(bytes, 0, bytes.Length);
+          file.Flush(true);
+        }
+        CheckAuthUnchanged(authPath, current);
+        // WSL 不支持 ReplaceFileW；同目录 Rename Overwrite 不允许退化成复制。
+        if (wsl)
+        {
+          if (!NativeMethods.MoveFileEx(temp, authPath, 1)) // MOVEFILE_REPLACE_EXISTING
+            throw new System.ComponentModel.Win32Exception();
+        }
+        else File.Replace(temp, authPath, null);
+        return refreshed.Access;
+      }
+      finally
+      {
+        try { File.Delete(temp); } catch { }
+      }
+    }
+
+    static void CheckAuthUnchanged(string path, string expected)
+    {
+      if (!string.Equals(File.ReadAllText(path, Encoding.UTF8), expected, StringComparison.Ordinal))
+        throw new IOException("Codex 凭据已变更，请重试");
+    }
+
+    static void PrepareAuthFile(string path, bool wsl)
+    {
+      if (!wsl)
+      {
+        var acl = new System.Security.AccessControl.FileSecurity();
+        acl.SetAccessRuleProtection(true, false);
+        using (var identity = System.Security.Principal.WindowsIdentity.GetCurrent())
+          acl.AddAccessRule(new System.Security.AccessControl.FileSystemAccessRule(identity.User,
+            System.Security.AccessControl.FileSystemRights.FullControl, System.Security.AccessControl.AccessControlType.Allow));
+        using (new FileStream(path, FileMode.CreateNew, System.Security.AccessControl.FileSystemRights.FullControl,
+          FileShare.None, 4096, FileOptions.None, acl)) { }
+        return;
+      }
+      // UNC 新文件继承发行版 umask，先创建空文件，再用同一发行版收紧权限。
+      string[] parts = path.Substring(2).Split(new[] { '\\' }, 3);
+      if (parts.Length != 3 || Array.Exists(parts[1].ToCharArray(), c => char.IsWhiteSpace(c) || c == '"'))
+        throw new IOException("无法保护 WSL 凭据临时文件");
+      using (new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None)) { }
+      var start = new System.Diagnostics.ProcessStartInfo(Path.Combine(Environment.SystemDirectory, "wsl.exe"),
+        "--distribution " + parts[1] + " --exec /usr/bin/xargs -0 /bin/chmod 600 --");
+      start.UseShellExecute = false;
+      start.WorkingDirectory = Environment.SystemDirectory;
+      start.CreateNoWindow = true;
+      start.RedirectStandardInput = true;
+      using (var process = System.Diagnostics.Process.Start(start))
+      {
+        // NUL 分隔传路径，保留空格和非 ASCII 字符、不经过 shell。
+        byte[] bytes = Encoding.UTF8.GetBytes("/" + parts[2].Replace('\\', '/') + "\0");
+        var input = process.StandardInput.BaseStream;
+        input.Write(bytes, 0, bytes.Length);
+        input.Dispose();
+        if (!process.WaitForExit(15000))
+        {
+          try { process.Kill(); } catch (InvalidOperationException) { }
+          throw new IOException("设置 WSL 凭据临时文件权限超时");
+        }
+        if (process.ExitCode != 0) throw new IOException("无法保护 WSL 凭据临时文件");
+      }
     }
 
     // 刷新响应里的 token 是成对轮换的：refresh_token 一次性，服务端换发新的一枚。
@@ -354,10 +448,10 @@ namespace Milkman
       public string IdToken = "";
     }
 
-    TokenRefresh RefreshAccessToken(string refreshToken)
+    static string RequestTokenRefresh(string refreshToken)
     {
       var body = "client_id=" + CodexClientId + "&grant_type=refresh_token&refresh_token=" + Uri.EscapeDataString(refreshToken);
-      return ParseRefresh(HttpPostForm(TokenUrl, body));
+      return HttpPostForm(TokenUrl, body);
     }
 
     static TokenRefresh ParseRefresh(string text)
@@ -409,7 +503,8 @@ namespace Milkman
       }
       // code_review_rate_limit 是独立周限，可选展示
       var crl = Map(d, "code_review_rate_limit");
-      if (crl != null) AddWindowFromDict(result, crl, "代码审查");
+      if (crl != null) AddWindowFromDict(result, Map(crl, "primary_window") ?? crl, "代码审查");
+      if (result.Windows.Count == 0) throw new Exception("wham/usage 响应无用量窗口");
       EnsureFiveHourWindow(result.Windows);
     }
 
@@ -436,7 +531,8 @@ namespace Milkman
 
     void AddWindowFromDict(GptFetchResult result, Dictionary<string, object> w, string label)
     {
-      if (w == null) return;
+      object used = Value(w, "used_percent");
+      if (used == null) return;
       var win = new UsageWindow();
       // 无显式 label 时按窗口秒数生成（18000→5h, 604800 或其他周四→周, 其余按天/小时）
       if (label == null)
@@ -450,8 +546,7 @@ namespace Milkman
         else label = (sec / 3600.0).ToString("F1") + "h";
       }
       win.Label = label;
-      object used = Value(w, "used_percent");
-      win.UsedPct = (used != null ? Convert.ToDouble(used) : 0) / 100.0;
+      win.UsedPct = Convert.ToDouble(used, CultureInfo.InvariantCulture) / 100.0;
       double resetMs = 0;
       object reset = Value(w, "reset_at") ?? Value(w, "resets_at_time");
       object after = Value(w, "reset_after_seconds");
@@ -572,11 +667,20 @@ namespace Milkman
       var credits = Map(root, "credits");
       if (credits == null) throw new Exception("Command Code 响应无法解析");
 
-      Dictionary<string, object> subscription = null;
-      if (subscriptionsBody != null && subscriptionsBody.Length > 0)
-        subscription = Map(Deserialize(subscriptionsBody) as Dictionary<string, object>, "data");
-      string planId = Text(subscription, "planId");
-      double periodEndMs = TimestampMs(Value(subscription, "currentPeriodEnd"));
+      string planId = "";
+      double periodEndMs = 0;
+      if (!string.IsNullOrEmpty(subscriptionsBody))
+      {
+        try
+        {
+          var subscription = Map(Deserialize(subscriptionsBody) as Dictionary<string, object>, "data");
+          planId = Text(subscription, "planId");
+          periodEndMs = TimestampMs(Value(subscription, "currentPeriodEnd"));
+        }
+        catch (FormatException) { }
+        catch (InvalidCastException) { }
+        catch (OverflowException) { }
+      }
 
       var limits = Map(root, "windowLimits") ?? Map(credits, "windowLimits");
       bool limited = true;
@@ -658,12 +762,18 @@ namespace Milkman
     }
 
     // ---------------- HTTP ----------------
-    // 返回响应体；401/403 -> null；网络错误抛异常
-    static string HttpGet(string url, string bearer)
+    // 只有 401 进入 OAuth 刷新；限流和其他失败交给当前来源的错误状态。
+    static string GetWhamUsage(string bearer)
     {
       string body; int status;
-      HttpGetWithStatus(url, bearer, out body, out status);
-      if (status == 401 || status == 403) return null;
+      HttpGetWithStatus(WhamUrl, bearer, out body, out status);
+      return WhamResponse(body, status);
+    }
+
+    static string WhamResponse(string body, int status)
+    {
+      if (status == 401) return null;
+      if (status < 200 || status >= 300) throw new Exception("wham/usage HTTP " + status);
       return body;
     }
 
@@ -868,17 +978,7 @@ namespace Milkman
       SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint
         | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
       Size = new Size(W, _formH);
-      // 参照 DeepSeek: 恢复吸附时先按 X clamp 到虚拟屏并设 y=0(屏内), 使 OnLoad 的 Screen.FromControl 能判对屏
-      if (_cfg.Docked && _cfg.X >= 0)
-      {
-        Rectangle vs = SystemInformation.VirtualScreen;
-        int x = Math.Max(vs.Left, Math.Min(_cfg.X, vs.Right - W));
-        Location = new Point(x, 0);
-      }
-      else
-        Location = (_cfg.X >= 0 && _cfg.Y >= 0)
-          ? new Point(_cfg.X, _cfg.Y)
-          : new Point(Screen.PrimaryScreen.WorkingArea.Right - W - 10, Screen.PrimaryScreen.WorkingArea.Bottom - _formH - 40);
+      RestoreLocation();
 
 
       MouseMove += OnMouseMoveHook;
@@ -899,7 +999,7 @@ namespace Milkman
 
       Load += (s, e) =>
       {
-        monRect = Screen.FromControl(this).Bounds;
+        if (!_cfg.Docked) monRect = Screen.FromControl(this).Bounds;
         if (_cfg.Docked)
         {
           docked = true;
@@ -1159,11 +1259,57 @@ namespace Milkman
       EnsureTopMost(); // 显示完成后再确认一次原生置顶标志
     }
 
+    void RestoreLocation()
+    {
+      Point saved = new Point(_cfg.X, _cfg.Y);
+      Screen screen = Screen.PrimaryScreen;
+      if (saved == new Point(-1, -1))
+      {
+        Rectangle area = screen.WorkingArea;
+        saved = new Point(area.Right - W - 10, area.Bottom - _formH - 40);
+      }
+      else
+      {
+        var window = new Rectangle(saved, Size);
+        screen = Screen.FromRectangle(window);
+        if (_cfg.Docked)
+        {
+          Screen[] screens = Screen.AllScreens;
+          int index = DockMonitorIndex(window, Array.ConvertAll(screens, s => s.Bounds));
+          if (index >= 0) screen = screens[index];
+        }
+      }
+      monRect = screen.Bounds;
+      Rectangle target = _cfg.Docked ? monRect : screen.WorkingArea;
+      Location = new Point(Math.Max(target.Left, Math.Min(saved.X, target.Right - Width)),
+        _cfg.Docked ? target.Top : Math.Max(target.Top, Math.Min(saved.Y, target.Bottom - Height)));
+    }
+
+    static int DockMonitorIndex(Rectangle window, Rectangle[] screens)
+    {
+      // 新配置保存屏幕顶边；旧配置可能保存的是收起时的位置。
+      int index = -1, bestOverlap = 0;
+      bool exact = false;
+      for (int i = 0; i < screens.Length; i++)
+      {
+        Rectangle screen = screens[i];
+        long aboveTop = (long)screen.Top - window.Top;
+        if (aboveTop < 0 || aboveTop > window.Height - Peek) continue;
+        int overlap = Math.Min(screen.Right, window.Right) - Math.Max(screen.Left, window.Left);
+        bool onTop = aboveTop == 0;
+        if (overlap <= 0 || (exact && !onTop) || (exact == onTop && overlap <= bestOverlap)) continue;
+        index = i;
+        bestOverlap = overlap;
+        exact = onTop;
+      }
+      return index;
+    }
+
     void SaveState()
     {
       var cfg = Config.Load();
       cfg.X = Location.X;
-      cfg.Y = Location.Y;
+      cfg.Y = docked ? monRect.Top : Location.Y;
       cfg.Docked = docked;
       cfg.Save();
     }

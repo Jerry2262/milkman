@@ -27,6 +27,46 @@ static class JsonRegression
         if (a is string || b is string || a is bool || b is bool) return a.Equals(b);
         return Convert.ToDecimal(a,CultureInfo.InvariantCulture) == Convert.ToDecimal(b,CultureInfo.InvariantCulture);
     }
+    static void CheckAuthRefresh() {
+        var core=typeof(DataFetcher).GetMethod("FetchGptCore", BindingFlags.NonPublic|BindingFlags.Instance);
+        string root=Environment.GetEnvironmentVariable("MILKMAN_AUTH_TEST_ROOT");
+        if (string.IsNullOrEmpty(root)) root=System.IO.Path.GetTempPath();
+        string dir=System.IO.Path.Combine(root,"Milkman 凭据-"+Guid.NewGuid().ToString("N"));
+        System.IO.Directory.CreateDirectory(dir);
+        string path=System.IO.Path.Combine(dir,"auth.json");
+        const string oldAuth="{\"tokens\":{\"access_token\":\"at1\",\"refresh_token\":\"rt1\"},\"label\":\"个人\"}";
+        const string cliAuth="{\"tokens\":{\"access_token\":\"cli-at\",\"refresh_token\":\"cli-rt\"}}";
+        const string usage="{\"rate_limit\":{\"primary_window\":{\"limit_window_seconds\":604800,\"used_percent\":10}}}";
+        const string rotated="{\"access_token\":\"at2\",\"refresh_token\":\"rt2\"}";
+        try {
+            System.IO.File.WriteAllText(path,oldAuth);
+            Func<string,string> cliWon=at => {
+                if (at=="at1") { System.IO.File.WriteAllText(path,cliAuth); return null; }
+                Check(at=="cli-at","reuse newer CLI access token");
+                return usage;
+            };
+            Func<string,string> noRefresh=rt => { throw new Exception("must not refresh an obsolete token"); };
+            core.Invoke(new DataFetcher(),new object[]{new GptFetchResult(),path,cliWon,noRefresh});
+            Check(System.IO.File.ReadAllText(path)==cliAuth,"clean read of newer credentials does not rewrite the file");
+
+            System.IO.File.WriteAllText(path,oldAuth);
+            Func<string,string> afterRefresh=at => at=="at2" ? usage : null;
+            Func<string,string> refresh=rt => { Check(rt=="rt1","refresh uses current token"); return rotated; };
+            core.Invoke(new DataFetcher(),new object[]{new GptFetchResult(),path,afterRefresh,refresh});
+            byte[] savedAuth=System.IO.File.ReadAllBytes(path);
+            string savedText=System.Text.Encoding.UTF8.GetString(savedAuth);
+            Check(savedText.Contains("\"refresh_token\":\"rt2\""),"rotated token reaches disk");
+            Check(savedAuth[0]=='{' && savedText.Contains("\"label\":\"个人\""),"auth rewrite preserves UTF-8 without BOM");
+
+            System.IO.File.WriteAllText(path,oldAuth);
+            Func<string,string> concurrentWrite=rt => { System.IO.File.WriteAllText(path,cliAuth); return rotated; };
+            bool rejected=false;
+            try { core.Invoke(new DataFetcher(),new object[]{new GptFetchResult(),path,afterRefresh,concurrentWrite}); }
+            catch (TargetInvocationException e) { rejected=e.InnerException.Message.Contains("凭据已变更"); }
+            Check(rejected && System.IO.File.ReadAllText(path)==cliAuth,"refresh does not overwrite an observed concurrent credential update");
+            Check(System.IO.Directory.GetFileSystemEntries(dir).Length==1,"refresh leaves no temporary credential file");
+        } finally { System.IO.Directory.Delete(dir,true); }
+    }
     static void Main() {
         System.Threading.Thread.CurrentThread.CurrentCulture = new CultureInfo("fr-FR");
         foreach (var json in new[] {
@@ -45,6 +85,21 @@ static class JsonRegression
         parse.Invoke(new DataFetcher(), new object[]{result,"{\"rate_limit\":{\"primary_window\":{\"limit_window_seconds\":604800,\"used_percent\":42.5,\"reset_at\":1900000000}},\"credits\":{\"has_credits\":false,\"balance\":null}}"});
         Check(result.Windows.Count==2 && result.Windows[0].Label=="5h" && result.Windows[0].Unlimited, "preserve 5h placeholder");
         Check(result.Windows[1].Label=="周" && Math.Abs(result.Windows[1].UsedPct-.425)<.000001, "parse GPT usage");
+        foreach (string badUsage in new[] { "{}", "{\"error\":\"rate limited\"}", "{\"rate_limit\":{\"primary_window\":{}}}" }) {
+            bool rejected=false;
+            try { parse.Invoke(new DataFetcher(), new object[]{new GptFetchResult(),badUsage}); }
+            catch (TargetInvocationException) { rejected=true; }
+            Check(rejected,"GPT must not report success without usable windows");
+        }
+        var whamResponse=typeof(DataFetcher).GetMethod("WhamResponse", Private);
+        Check(whamResponse!=null && whamResponse.Invoke(null,new object[]{"",401})==null,"only unauthorized enters token refresh");
+        foreach (int status in new[] { 403, 429, 500 }) {
+            bool rejected=false;
+            try { whamResponse.Invoke(null,new object[]{"{\"rate_limit\":{}}",status}); }
+            catch (TargetInvocationException e) { rejected=e.InnerException.Message.EndsWith(status.ToString()); }
+            Check(rejected,"GPT HTTP failure preserves status and does not refresh");
+        }
+        CheckAuthRefresh();
         // 刷新响应里的 token 成对轮换：refresh_token/id_token 必须一起写回，否则下次刷新被 reused 拒绝
         var parseRefresh=typeof(DataFetcher).GetMethod("ParseRefresh", Private);
         var applyRefresh=typeof(DataFetcher).GetMethod("ApplyRefresh", Private);
@@ -82,6 +137,15 @@ static class JsonRegression
         Check(nullValues.X==-1 && nullValues.Y==-1 && !nullValues.Docked && nullValues.RefreshSeconds==60,"config null values fall back to defaults");
         Check(Config.Parse("{\"RefreshSeconds\":0}").RefreshSeconds==60,"zero refresh interval falls back to default");
         Check(Config.Parse("{\"RefreshSeconds\":-30}").RefreshSeconds==60,"negative refresh interval falls back to default");
+        Check(Config.Parse("{\"RefreshSeconds\":2147484,\"OpenCodeAccounts\":[]}").RefreshSeconds==60,"overflowing timer interval falls back");
+        Check(Config.Parse("{\"RefreshSeconds\":2147483,\"OpenCodeAccounts\":[]}").RefreshSeconds==2147483,"largest supported whole-second interval");
+        var oversizedInterval=Config.Parse("{\"RefreshSeconds\":2147483648,\"X\":42,\"OpenCodeAccounts\":[]}");
+        Check(oversizedInterval.RefreshSeconds==60 && oversizedInterval.X==42,"out-of-range interval does not discard other settings");
+        var dockScreen=typeof(MilkmanForm).GetMethod("DockMonitorIndex", Private);
+        var screens=new[] { new System.Drawing.Rectangle(0,0,1920,1080), new System.Drawing.Rectangle(0,-1080,1920,1080), new System.Drawing.Rectangle(-1920,0,1920,1080) };
+        Check(dockScreen!=null && (int)dockScreen.Invoke(null,new object[]{new System.Drawing.Rectangle(100,-1080,520,244),screens})==1,"restore docked upper screen");
+        Check((int)dockScreen.Invoke(null,new object[]{new System.Drawing.Rectangle(100,-1319,520,244),screens})==1,"restore legacy collapsed upper screen");
+        Check((int)dockScreen.Invoke(null,new object[]{new System.Drawing.Rectangle(-900,-239,520,244),screens})==2,"restore legacy collapsed left screen");
         var nullAccounts=Config.Parse("{\"OpenCodeAccounts\":[null,{\"Name\":\"only\"}]}");
         Check(nullAccounts.OpenCodeAccounts.Count==1 && nullAccounts.OpenCodeAccounts[0].Name=="only","null account entries ignored");
         string stampText=Program.NowRfc3339();
@@ -136,6 +200,10 @@ static class JsonRegression
         parseCc.Invoke(fetcher,new object[]{ccGrant,
           "{\"credits\":{\"monthlyCredits\":25,\"monthlyCreditsGranted\":50},\"windowLimits\":{\"fiveHour\":{\"used\":0,\"cap\":14,\"resetAt\":0}}}",null});
         Check(ccGrant.Windows[2]!=null && Math.Abs(ccGrant.Windows[2].UsedPct-0.5)<1e-12 && ccGrant.Windows[1]==null,"command code reported grant wins");
+        var ccBadSubscription=new CommandCodeSnapshot();
+        parseCc.Invoke(fetcher,new object[]{ccBadSubscription,
+          "{\"credits\":{\"monthlyCredits\":25,\"monthlyCreditsGranted\":50},\"windowLimits\":{\"fiveHour\":{\"used\":1,\"cap\":4},\"weekly\":{\"used\":2,\"cap\":8}}}","<html>"});
+        Check(ccBadSubscription.Windows[0].UsedPct==0.25 && ccBadSubscription.Windows[1].UsedPct==0.25 && ccBadSubscription.Windows[2].UsedPct==0.5 && ccBadSubscription.Windows[2].ResetMs==0,"malformed optional subscription keeps credits data");
         var ccSeconds=new CommandCodeSnapshot();
         parseCc.Invoke(fetcher,new object[]{ccSeconds,
           "{\"credits\":{\"monthlyCredits\":0},\"windowLimits\":{\"fiveHour\":{\"used\":1,\"cap\":4,\"resetAt\":1793881990}}}",null});
