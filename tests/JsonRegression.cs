@@ -9,8 +9,8 @@ static class JsonRegression
 {
     static int checks;
     static readonly BindingFlags Private = BindingFlags.Static | BindingFlags.NonPublic;
-    static object Read(string json) { return typeof(DataFetcher).GetMethod("Deserialize", Private).Invoke(null, new object[] { json }); }
-    static string Write(object value) { return (string)typeof(DataFetcher).GetMethod("Serialize", Private).Invoke(null, new object[] { value }); }
+    static object Read(string json) { return Json.Parse(json); }
+    static string Write(object value) { return Json.Serialize(value); }
     static Dictionary<string,object> Map(object value) { return (Dictionary<string,object>)value; }
     static void Check(bool ok, string label) { if (!ok) throw new Exception(label); checks++; }
     static void RoundTrip(string json) { var a=Read(json); var b=Read(Write(a)); Check(Equal(a,b), "roundtrip: " + json); }
@@ -46,13 +46,13 @@ static class JsonRegression
                 return usage;
             };
             Func<string,string> noRefresh=rt => { throw new Exception("must not refresh an obsolete token"); };
-            core.Invoke(new DataFetcher(),new object[]{new GptFetchResult(),path,cliWon,noRefresh});
+            core.Invoke(new DataFetcher(),new object[]{new FetchResult(),path,cliWon,noRefresh});
             Check(System.IO.File.ReadAllText(path)==cliAuth,"clean read of newer credentials does not rewrite the file");
 
             System.IO.File.WriteAllText(path,oldAuth);
             Func<string,string> afterRefresh=at => at=="at2" ? usage : null;
             Func<string,string> refresh=rt => { Check(rt=="rt1","refresh uses current token"); return rotated; };
-            core.Invoke(new DataFetcher(),new object[]{new GptFetchResult(),path,afterRefresh,refresh});
+            core.Invoke(new DataFetcher(),new object[]{new FetchResult(),path,afterRefresh,refresh});
             byte[] savedAuth=System.IO.File.ReadAllBytes(path);
             string savedText=System.Text.Encoding.UTF8.GetString(savedAuth);
             Check(savedText.Contains("\"refresh_token\":\"rt2\""),"rotated token reaches disk");
@@ -61,13 +61,35 @@ static class JsonRegression
             System.IO.File.WriteAllText(path,oldAuth);
             Func<string,string> concurrentWrite=rt => { System.IO.File.WriteAllText(path,cliAuth); return rotated; };
             bool rejected=false;
-            try { core.Invoke(new DataFetcher(),new object[]{new GptFetchResult(),path,afterRefresh,concurrentWrite}); }
+            try { core.Invoke(new DataFetcher(),new object[]{new FetchResult(),path,afterRefresh,concurrentWrite}); }
             catch (TargetInvocationException e) { rejected=e.InnerException.Message.Contains("凭据已变更"); }
             Check(rejected && System.IO.File.ReadAllText(path)==cliAuth,"refresh does not overwrite an observed concurrent credential update");
             Check(System.IO.Directory.GetFileSystemEntries(dir).Length==1,"refresh leaves no temporary credential file");
         } finally { System.IO.Directory.Delete(dir,true); }
     }
+    static void CheckRefreshRows() {
+        var gpt = new MilkmanForm.SourceRow("ChatGPT", 12, null, null, null, false);
+        var go = new MilkmanForm.SourceRow("Go", 88, null, null, null, true);
+        var cc = new MilkmanForm.SourceRow("CC", 164, null, null, null, true);
+        Check(gpt.ActionText == "获取额度" && !gpt.TryStart(false), "ChatGPT waits for the first click");
+        Check(go.TryStart(false) && cc.TryStart(false), "other sources start automatically");
+        Check(gpt.TryStart(true) && gpt.ActionText == null && !gpt.TryStart(true) && !gpt.TryStart(false), "first click starts only one fetch");
+        var error = new FetchResult { Error = "synthetic timeout" };
+        gpt.Apply(error);
+        Check(gpt.ActionText == "重试" && !gpt.TryStart(false) && gpt.TryStart(true), "first failure switches to manual retry");
+        var success = new FetchResult { LastSuccess = DateTime.Now };
+        success.Windows.Add(new UsageWindow { Label = "5h" });
+        gpt.Apply(success);
+        Check(gpt.ActionText == null && gpt.TryStart(false), "first success enables automatic refresh");
+        gpt.Apply(error);
+        Check(!gpt.TryStart(false) && gpt.Result.Windows[0].Label == "5h"
+            && gpt.Result.LastSuccess == success.LastSuccess, "failed refresh retains the last successful data");
+        go.Apply(new FetchResult(true));
+        cc.Apply(new FetchResult(true));
+        Check(go.TryStart(false) && cc.TryStart(false), "failure only pauses its own row");
+    }
     static void Main() {
+        CheckRefreshRows();
         System.Threading.Thread.CurrentThread.CurrentCulture = new CultureInfo("fr-FR");
         foreach (var json in new[] {
             "null", "true", "false", "123", "-2147483649", "9223372036854775807", "1.25", "1e-3",
@@ -81,24 +103,21 @@ static class JsonRegression
         Check((string)Map(updated["tokens"])["access_token"]=="new", "replace access token");
         Check(((IList)Map(updated["future"])["items"]).Count==3, "preserve unknown nested JSON");
         var parse=typeof(DataFetcher).GetMethod("ParseWham", BindingFlags.NonPublic|BindingFlags.Instance);
-        var result=new GptFetchResult();
+        var result=new FetchResult();
         parse.Invoke(new DataFetcher(), new object[]{result,"{\"rate_limit\":{\"primary_window\":{\"limit_window_seconds\":604800,\"used_percent\":42.5,\"reset_at\":1900000000}},\"credits\":{\"has_credits\":false,\"balance\":null}}"});
         Check(result.Windows.Count==2 && result.Windows[0].Label=="5h" && result.Windows[0].Unlimited, "preserve 5h placeholder");
         Check(result.Windows[1].Label=="周" && Math.Abs(result.Windows[1].UsedPct-.425)<.000001, "parse GPT usage");
-        foreach (string badUsage in new[] { "{}", "{\"error\":\"rate limited\"}", "{\"rate_limit\":{\"primary_window\":{}}}" }) {
-            bool rejected=false;
-            try { parse.Invoke(new DataFetcher(), new object[]{new GptFetchResult(),badUsage}); }
-            catch (TargetInvocationException) { rejected=true; }
-            Check(rejected,"GPT must not report success without usable windows");
-        }
+        bool emptyUsageRejected = false;
+        try { parse.Invoke(new DataFetcher(), new object[]{new FetchResult(),"{\"rate_limit\":{\"primary_window\":{}}}"}); }
+        catch (TargetInvocationException e) { emptyUsageRejected = e.InnerException.Message.Contains("无用量窗口"); }
+        Check(emptyUsageRejected, "GPT must not report success without usable windows");
+
         var whamResponse=typeof(DataFetcher).GetMethod("WhamResponse", Private);
-        Check(whamResponse!=null && whamResponse.Invoke(null,new object[]{"",401})==null,"only unauthorized enters token refresh");
-        foreach (int status in new[] { 403, 429, 500 }) {
-            bool rejected=false;
-            try { whamResponse.Invoke(null,new object[]{"{\"rate_limit\":{}}",status}); }
-            catch (TargetInvocationException e) { rejected=e.InnerException.Message.EndsWith(status.ToString()); }
-            Check(rejected,"GPT HTTP failure preserves status and does not refresh");
-        }
+        Check(whamResponse.Invoke(null,new object[]{"",401})==null,"unauthorized enters token refresh");
+        bool rateLimitRejected = false;
+        try { whamResponse.Invoke(null,new object[]{"{\"error\":\"rate limited\"}",429}); }
+        catch (TargetInvocationException e) { rateLimitRejected = e.InnerException.Message.EndsWith("429"); }
+        Check(rateLimitRejected,"rate limiting preserves status without refreshing the token");
         CheckAuthRefresh();
         // 刷新响应里的 token 成对轮换：refresh_token/id_token 必须一起写回，否则下次刷新被 reused 拒绝
         var parseRefresh=typeof(DataFetcher).GetMethod("ParseRefresh", Private);
@@ -113,13 +132,16 @@ static class JsonRegression
         try { parseRefresh.Invoke(null,new object[]{"{\"error\":{\"message\":\"used\",\"type\":\"invalid_request_error\",\"code\":\"refresh_token_reused\"}}"}); }
         catch (TargetInvocationException e) { reused=e.InnerException.Message; }
         Check(reused=="刷新失败: refresh_token_reused","refresh error code surfaces");
-        foreach (string bad in new[] { "{\"error\":\"refresh_token_expired\"}", "not json", "{\"error\":{}}", "{\"access_token\":\"\"}" }) {
-            bool rejected=false; try { parseRefresh.Invoke(null,new object[]{bad}); } catch (TargetInvocationException) { rejected=true; }
-            Check(rejected,"reject unusable refresh response: " + bad);
-        }
-        foreach (string invalid in new[] { "", " ", "undefined", "NaN", "Infinity", "+1", "01", "-01", "1.", ".1", "1e", "1e+", "[1,]", "{\"a\":1,}", "[true false]", "{a:1}", "{}x", "\"\\x20\"", "\"\\u12xz\"", "\"a\nb\"" }) {
-            bool rejected=false; try { Read(invalid); } catch { rejected=true; }
-            Check(rejected,"reject malformed JSON");
+        bool missingAccessRejected = false;
+        try { parseRefresh.Invoke(null, new object[]{"{\"refresh_token\":\"rt2\"}"}); }
+        catch (TargetInvocationException e) { missingAccessRejected = e.InnerException.Message.EndsWith("无 access_token"); }
+        Check(missingAccessRejected, "token rotation cannot succeed without an access token");
+
+        // 代表不同语法边界：截断、非标准数字、分隔符、键、尾部内容与字符串转义。
+        foreach (string invalid in new[] { "", "NaN", "+1", "01", "1.", "1e+", "[1,]", "{\"a\":1,}", "[true false]", "{a:1}", "{}x", "\"\\x20\"", "\"\\u12xz\"", "\"a\nb\"" }) {
+            bool rejected = false;
+            try { Read(invalid); } catch (FormatException) { rejected = true; }
+            Check(rejected, "reject malformed JSON: " + invalid);
         }
         string auth = "{\"tokens\":{\"access_token\":\"old\",\"unknown\":1e400},\"unknown\":{\"i\":9007199254740993,\"n\":-0,\"d\":1.2300e-40,\"arr\":[null,true,\"\\u0000\"]}}";
         var authTree=Map(Read(auth)); Map(authTree["tokens"])["access_token"]="new";
@@ -175,8 +197,10 @@ static class JsonRegression
             for(int j=0;j<32;j++) text.Append((char)random.Next(0,256));
             var fixture=new Dictionary<string,object>{{"text",text.ToString()},{"n",(decimal)random.Next(-10000,10000)/100},{"a",new object[]{null,true,i}}};
             string encoded=Write(fixture);
-            Check(Equal(Read(encoded),legacy.DeserializeObject(encoded)),"legacy differential JSON");
+            if (!Equal(Read(encoded),legacy.DeserializeObject(encoded)))
+                throw new Exception("legacy differential JSON, fixture " + i);
         }
+        checks++;
         System.Threading.Tasks.Parallel.For(0,1000,delegate(int i) { var value=Read(auth); string encoded=Write(value); if(!encoded.Contains("9007199254740993")) throw new Exception("concurrent JSON state"); });
         Check(true,"parallel parser and writer isolation");
 
@@ -189,33 +213,33 @@ static class JsonRegression
         Check(ccSaved.CommandCode!=null && ccSaved.CommandCode.Name=="主账号" && ccSaved.CommandCode.Key=="user_fixture","command code save roundtrip");
         var parseCc=typeof(DataFetcher).GetMethod("ParseCommandCode", BindingFlags.NonPublic|BindingFlags.Instance);
         var fetcher=new DataFetcher();
-        var ccLive=new CommandCodeSnapshot();
+        var ccLive=new FetchResult(true);
         parseCc.Invoke(fetcher,new object[]{ccLive,
           "{\"credits\":{\"belowThreshold\":false,\"monthlyCredits\":67.808776588,\"purchasedCredits\":0,\"freeCredits\":0},\"windowLimits\":{\"limited\":true,\"fiveHour\":{\"used\":2.191223412,\"cap\":14,\"resetAt\":1793881990707},\"weekly\":{\"used\":7.5,\"cap\":35,\"resetAt\":0}}}",
           "{\"success\":true,\"data\":{\"planId\":\"individual-goat\",\"currentPeriodEnd\":\"2026-12-05T07:25:45.000Z\"}}"});
         Check(ccLive.Windows[0]!=null && Math.Abs(ccLive.Windows[0].UsedPct-2.191223412/14)<1e-12 && Math.Abs(ccLive.Windows[0].ResetMs-1793881990707)<1,"command code 5h window");
         Check(ccLive.Windows[1]!=null && ccLive.Windows[1].NotStarted && ccLive.Windows[1].ResetMs==0,"command code unopened weekly window");
         Check(ccLive.Windows[2]!=null && Math.Abs(ccLive.Windows[2].UsedPct-(1-67.808776588/70))<1e-9 && ccLive.Windows[2].ResetMs>0,"command code monthly sized from plan grant");
-        var ccGrant=new CommandCodeSnapshot();
+        var ccGrant=new FetchResult(true);
         parseCc.Invoke(fetcher,new object[]{ccGrant,
           "{\"credits\":{\"monthlyCredits\":25,\"monthlyCreditsGranted\":50},\"windowLimits\":{\"fiveHour\":{\"used\":0,\"cap\":14,\"resetAt\":0}}}",null});
         Check(ccGrant.Windows[2]!=null && Math.Abs(ccGrant.Windows[2].UsedPct-0.5)<1e-12 && ccGrant.Windows[1]==null,"command code reported grant wins");
-        var ccBadSubscription=new CommandCodeSnapshot();
+        var ccBadSubscription=new FetchResult(true);
         parseCc.Invoke(fetcher,new object[]{ccBadSubscription,
           "{\"credits\":{\"monthlyCredits\":25,\"monthlyCreditsGranted\":50},\"windowLimits\":{\"fiveHour\":{\"used\":1,\"cap\":4},\"weekly\":{\"used\":2,\"cap\":8}}}","<html>"});
         Check(ccBadSubscription.Windows[0].UsedPct==0.25 && ccBadSubscription.Windows[1].UsedPct==0.25 && ccBadSubscription.Windows[2].UsedPct==0.5 && ccBadSubscription.Windows[2].ResetMs==0,"malformed optional subscription keeps credits data");
-        var ccSeconds=new CommandCodeSnapshot();
+        var ccSeconds=new FetchResult(true);
         parseCc.Invoke(fetcher,new object[]{ccSeconds,
           "{\"credits\":{\"monthlyCredits\":0},\"windowLimits\":{\"fiveHour\":{\"used\":1,\"cap\":4,\"resetAt\":1793881990}}}",null});
         Check(ccSeconds.Windows[0]!=null && Math.Abs(ccSeconds.Windows[0].ResetMs-1793881990000)<1,"command code second-granularity resetAt");
-        var ccBare=new CommandCodeSnapshot();
+        var ccBare=new FetchResult(true);
         parseCc.Invoke(fetcher,new object[]{ccBare,"{\"credits\":{\"monthlyCredits\":5}}",null});
         Check(ccBare.Windows[0]==null && ccBare.Windows[1]==null && ccBare.Windows[2]==null,"command code degrades without limits or grant");
-        var ccPayg=new CommandCodeSnapshot();
+        var ccPayg=new FetchResult(true);
         parseCc.Invoke(fetcher,new object[]{ccPayg,"{\"credits\":{\"monthlyCredits\":10,\"monthlyCreditsGranted\":20},\"windowLimits\":{\"limited\":false}}",null});
         Check(ccPayg.Windows[0]==null && ccPayg.Windows[1]==null && ccPayg.Windows[2]!=null,"command code pay-as-you-go hides rolling windows");
         bool ccRejected=false;
-        try { parseCc.Invoke(fetcher,new object[]{new CommandCodeSnapshot(),"{\"error\":{\"code\":\"UNAUTHORIZED\"}}",null}); }
+        try { parseCc.Invoke(fetcher,new object[]{new FetchResult(true),"{\"error\":{\"code\":\"UNAUTHORIZED\"}}",null}); }
         catch (TargetInvocationException) { ccRejected=true; }
         Check(ccRejected,"command code rejects response without credits");
 

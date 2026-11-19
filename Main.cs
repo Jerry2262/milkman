@@ -246,26 +246,16 @@ namespace Milkman
     public bool NotStarted; // rolling 窗口无用量: 服务端返回的是占位 resetsAt
   }
 
-  class GptFetchResult
+  class FetchResult
   {
-    public List<UsageWindow> Windows = new List<UsageWindow>();
+    public readonly IList<UsageWindow> Windows;
     public string Error;
     public DateTime LastSuccess;
-  }
 
-  class GoAccountSnapshot
-  {
-    public string Name;
-    public UsageWindow[] Windows = new UsageWindow[3]; // 5h / 周 / 月
-    public string Error;
-    public DateTime LastSuccess;
-  }
-
-  class CommandCodeSnapshot
-  {
-    public UsageWindow[] Windows = new UsageWindow[3]; // 5h / 周 / 月
-    public string Error;
-    public DateTime LastSuccess;
+    public FetchResult(bool fixedWindows = false)
+    {
+      Windows = fixedWindows ? (IList<UsageWindow>)new UsageWindow[3] : new List<UsageWindow>();
+    }
   }
 
   // =======================================================================
@@ -282,9 +272,9 @@ namespace Milkman
     // Cloudflare 1010: opencode.ai 按浏览器签名拦截, 需浏览器 UA
     const string BrowserUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 
-    public GptFetchResult FetchGpt(string authPath)
+    public FetchResult FetchGpt(string authPath)
     {
-      var result = new GptFetchResult();
+      var result = new FetchResult();
       try
       {
         FetchGptCore(result, authPath, GetWhamUsage, RequestTokenRefresh);
@@ -295,13 +285,6 @@ namespace Milkman
     }
 
     static string Short(string s) { return s.Length > 80 ? s.Substring(0, 80) + "…" : s; }
-
-    static object Deserialize(string json)
-    {
-      return Json.Parse(json);
-    }
-
-    static string Serialize(object value) { return Json.Serialize(value); }
 
     static object Value(Dictionary<string, object> d, string key)
     {
@@ -320,7 +303,7 @@ namespace Milkman
     }
 
     // ---------------- ChatGPT ----------------
-    void FetchGptCore(GptFetchResult result, string authPath,
+    void FetchGptCore(FetchResult result, string authPath,
       Func<string, string> getUsage, Func<string, string> requestRefresh)
     {
       // 留空走 Windows 侧默认位置；显式路径不回退到其他凭据。
@@ -348,7 +331,7 @@ namespace Milkman
 
     static string ReadAccessToken(string json)
     {
-      var dict = Deserialize(json) as Dictionary<string, object>;
+      var dict = Json.Parse(json) as Dictionary<string, object>;
       string access = Text(Map(dict, "tokens"), "access_token");
       if (access.Length == 0) throw new Exception("codex auth.json 无 access_token");
       return access;
@@ -356,7 +339,7 @@ namespace Milkman
 
     static string RefreshGptFile(string authPath, string current, Func<string, string> requestRefresh)
     {
-      var dict = Deserialize(current) as Dictionary<string, object>;
+      var dict = Json.Parse(current) as Dictionary<string, object>;
       var tokens = Map(dict, "tokens");
       string refresh = Text(tokens, "refresh_token");
       if (refresh.Length == 0) throw new Exception("codex auth.json 无 refresh_token");
@@ -373,7 +356,7 @@ namespace Milkman
         dict["last_refresh"] = Program.NowRfc3339();
         using (var file = new FileStream(temp, FileMode.Open, FileAccess.Write, FileShare.None))
         {
-          byte[] bytes = Encoding.UTF8.GetBytes(Serialize(dict));
+          byte[] bytes = Encoding.UTF8.GetBytes(Json.Serialize(dict));
           file.Write(bytes, 0, bytes.Length);
           file.Flush(true);
         }
@@ -458,7 +441,7 @@ namespace Milkman
     {
       // 非 JSON（例如 Cloudflare 拦截页）也归到解析失败，不把语法制式异常抛给 UI
       Dictionary<string, object> d = null;
-      try { d = Deserialize(text) as Dictionary<string, object>; }
+      try { d = Json.Parse(text) as Dictionary<string, object>; }
       catch { }
       if (d == null) throw new Exception("刷新失败: 响应无法解析");
       // 刷新可能返回 refresh_token_expired / reused / invalidated 等错误码
@@ -489,9 +472,9 @@ namespace Milkman
       if (!string.IsNullOrEmpty(refreshed.IdToken)) tokens["id_token"] = refreshed.IdToken;
     }
 
-    void ParseWham(GptFetchResult result, string resp)
+    void ParseWham(FetchResult result, string resp)
     {
-      var d = Deserialize(resp) as Dictionary<string, object>;
+      var d = Json.Parse(resp) as Dictionary<string, object>;
       if (d == null) throw new Exception("wham 响应无法解析");
 
       var rl = Map(d, "rate_limit");
@@ -509,7 +492,7 @@ namespace Milkman
     }
 
     // 服务端临时不返回 5h 时仍保留版位；字段恢复后自动换回真实数据。
-    static void EnsureFiveHourWindow(List<UsageWindow> windows)
+    static void EnsureFiveHourWindow(IList<UsageWindow> windows)
     {
       int index = -1;
       for (int i = 0; i < windows.Count; i++)
@@ -524,12 +507,12 @@ namespace Milkman
       }
     }
 
-    void AddWindow(GptFetchResult result, Dictionary<string, object> rl, string key, string label)
+    void AddWindow(FetchResult result, Dictionary<string, object> rl, string key, string label)
     {
       AddWindowFromDict(result, Map(rl, key), label);
     }
 
-    void AddWindowFromDict(GptFetchResult result, Dictionary<string, object> w, string label)
+    void AddWindowFromDict(FetchResult result, Dictionary<string, object> w, string label)
     {
       object used = Value(w, "used_percent");
       if (used == null) return;
@@ -560,9 +543,9 @@ namespace Milkman
     // 官方端点: GET https://opencode.ai/zen/go/v1/usage, Bearer = auth.json 中 opencode-go.key
     // 返回 { usage: { rolling, weekly, monthly } }, 各含 percent(0-100) + resetsAt(ISO8601),
     // 账户级服务端计费(与官方 dashboard 一致, 其他机器/工具消费同样计入)
-    public GoAccountSnapshot FetchGo(OpenCodeAccountConfig cfg)
+    public FetchResult FetchGo(OpenCodeAccountConfig cfg)
     {
-      var account = new GoAccountSnapshot { Name = cfg.Name };
+      var account = new FetchResult(true);
       try
       {
         FetchGoCore(account, cfg);
@@ -572,7 +555,7 @@ namespace Milkman
       return account;
     }
 
-    void FetchGoCore(GoAccountSnapshot account, OpenCodeAccountConfig cfg)
+    void FetchGoCore(FetchResult account, OpenCodeAccountConfig cfg)
     {
       // OpenCode 2 把凭据迁进 opencode.db，auth.json 不再更新；配置里的 Key 优先。
       string key = (cfg.Key ?? "").Trim();
@@ -581,7 +564,7 @@ namespace Milkman
         string authPath = cfg.AuthPath;
         if (string.IsNullOrEmpty(authPath) || !File.Exists(authPath))
           throw new Exception("未配置 Go key");
-        var d = Deserialize(File.ReadAllText(authPath)) as Dictionary<string, object>;
+        var d = Json.Parse(File.ReadAllText(authPath)) as Dictionary<string, object>;
         var goe = Map(d, "opencode-go");
         key = Text(goe, "key").Trim();
         if (key.Length == 0) throw new Exception("未登录 OpenCode Go");
@@ -592,7 +575,7 @@ namespace Milkman
       if (status == 401) throw new Exception("Go key 被拒绝");
       if (status == 403) throw new Exception("该 key 无 Go 订阅");
       if (status < 200 || status >= 300) throw new Exception("Go usage HTTP " + status);
-      var u = Deserialize(body) as Dictionary<string, object>;
+      var u = Json.Parse(body) as Dictionary<string, object>;
       var usage = Map(u, "usage");
       if (usage == null) throw new Exception("Go usage 响应无法解析");
       account.Windows[0] = ParseGoWindow(usage, "rolling", "5h", true);
@@ -625,9 +608,9 @@ namespace Milkman
     //        windowLimits: { limited, fiveHour: { used, cap, resetAt }, weekly: { ... } } }
     //   GET /alpha/billing/subscriptions -> 套餐 id 与账单周期(月度重置时间); 仅兜底, 失败不影响滚动窗口
     // resetAt 是 epoch 毫秒(0 = 窗口未开始); 5h/周是滚动窗口, 从首次请求起算
-    public CommandCodeSnapshot FetchCommandCode(CommandCodeConfig cfg)
+    public FetchResult FetchCommandCode(CommandCodeConfig cfg)
     {
-      var snapshot = new CommandCodeSnapshot();
+      var snapshot = new FetchResult(true);
       try
       {
         FetchCommandCodeCore(snapshot, cfg);
@@ -637,7 +620,7 @@ namespace Milkman
       return snapshot;
     }
 
-    void FetchCommandCodeCore(CommandCodeSnapshot snapshot, CommandCodeConfig cfg)
+    void FetchCommandCodeCore(FetchResult snapshot, CommandCodeConfig cfg)
     {
       string key = (cfg.Key ?? "").Trim();
       if (key.Length == 0) throw new Exception("未配置 Command Code key");
@@ -661,9 +644,9 @@ namespace Milkman
       ParseCommandCode(snapshot, body, subscriptions);
     }
 
-    void ParseCommandCode(CommandCodeSnapshot snapshot, string creditsBody, string subscriptionsBody)
+    void ParseCommandCode(FetchResult snapshot, string creditsBody, string subscriptionsBody)
     {
-      var root = Deserialize(creditsBody) as Dictionary<string, object>;
+      var root = Json.Parse(creditsBody) as Dictionary<string, object>;
       var credits = Map(root, "credits");
       if (credits == null) throw new Exception("Command Code 响应无法解析");
 
@@ -673,7 +656,7 @@ namespace Milkman
       {
         try
         {
-          var subscription = Map(Deserialize(subscriptionsBody) as Dictionary<string, object>, "data");
+          var subscription = Map(Json.Parse(subscriptionsBody) as Dictionary<string, object>, "data");
           planId = Text(subscription, "planId");
           periodEndMs = TimestampMs(Value(subscription, "currentPeriodEnd"));
         }
@@ -788,36 +771,11 @@ namespace Milkman
       return req;
     }
 
-    // 与 HttpGet 相同但保留状态码与响应体(错误分类用); 网络错误抛异常
     static void HttpGetWithStatus(string url, string bearer, out string body, out int status)
     {
-      var req = CreateRequest(url, "GET", bearer);
-      try
-      {
-        using (var resp = (HttpWebResponse)req.GetResponse())
-        using (var s = resp.GetResponseStream())
-        using (var r = new StreamReader(s))
-        {
-          body = r.ReadToEnd();
-          status = (int)resp.StatusCode;
-        }
-      }
-      catch (WebException e)
-      {
-        var resp = e.Response as HttpWebResponse;
-        if (resp != null)
-        {
-          status = (int)resp.StatusCode;
-          using (var s = resp.GetResponseStream())
-          using (var r = new StreamReader(s))
-            body = r.ReadToEnd();
-          return;
-        }
-        throw new Exception("HTTP " + e.Message);
-      }
+      body = ReadResponse(CreateRequest(url, "GET", bearer), out status);
     }
 
-    // 返回响应体；4xx/5xx 也返回 body（刷新失败的错误码在 body 里），网络错误抛异常
     static string HttpPostForm(string url, string body)
     {
       var req = CreateRequest(url, "POST", null);
@@ -825,20 +783,26 @@ namespace Milkman
       var bytes = Encoding.UTF8.GetBytes(body);
       req.ContentLength = bytes.Length;
       using (var s = req.GetRequestStream()) s.Write(bytes, 0, bytes.Length);
-      try
-      {
-        using (var resp = (HttpWebResponse)req.GetResponse())
-        using (var s = resp.GetResponseStream())
-        using (var r = new StreamReader(s))
-          return r.ReadToEnd();
-      }
+      int status;
+      return ReadResponse(req, out status);
+    }
+
+    // 4xx/5xx 也保留响应体（如 OAuth 错误码），无 HTTP 响应的网络错误才抛出。
+    static string ReadResponse(HttpWebRequest req, out int status)
+    {
+      HttpWebResponse response;
+      try { response = (HttpWebResponse)req.GetResponse(); }
       catch (WebException e)
       {
-        var resp = e.Response as HttpWebResponse;
-        if (resp == null) throw new Exception("HTTP " + e.Message);
-        using (var s = resp.GetResponseStream())
-        using (var r = new StreamReader(s))
-          return r.ReadToEnd();
+        response = e.Response as HttpWebResponse;
+        if (response == null) throw new Exception("HTTP " + e.Message);
+      }
+      using (response)
+      using (var stream = response.GetResponseStream())
+      using (var reader = new StreamReader(stream))
+      {
+        status = (int)response.StatusCode;
+        return reader.ReadToEnd();
       }
     }
   }
@@ -908,8 +872,7 @@ namespace Milkman
     readonly Font fontBig, fontMid, fontTick;
     readonly Rectangle closeRect = new Rectangle(W - 26, 7, 15, 15);
     bool hoverClose;
-    const int NoRetry = -2, GptRetry = -1, CcRetry = -3;
-    int _hoverRetry = NoRetry;
+    SourceRow _hoverAction;
 
     // 吸附与动画（参照 DeepSeekTimeline：WM_NCHITTEST 拖动 + 顶部吸附 + 缓出）
     const int WM_NCHITTEST = 0x84, HTCLIENT = 1, HTCAPTION = 2;
@@ -919,46 +882,64 @@ namespace Milkman
     const int WM_SYSCOMMAND = 0x112, SC_MAXIMIZE = 0xF030;
     const int WM_NCLBUTTONDBLCLK = 0xA3;
     const int Peek = 5; // 吸附收起时顶部保留的提示条高度(px), 与 DeepSeekTimeline 一致
+    const int DockIdleMs = 100, DockAnimationMs = 30;
     bool docked, expanded, dragging, pinned; // pinned = 双击钉住, DockTick 不自动收放
     Rectangle monRect;
     Timer _dockTimer;
 
     Config _cfg;
     DataFetcher _fetcher;
-    GptFetchResult _gpt = new GptFetchResult();
-    List<GoAccountSnapshot> _goAccounts = new List<GoAccountSnapshot>();
-    string _goError;
-    CommandCodeConfig _ccConfig;
-    CommandCodeSnapshot _cc = new CommandCodeSnapshot();
+    readonly List<SourceRow> _sources = new List<SourceRow>();
     Timer _refreshTimer = new Timer();
     Timer _clockTimer = new Timer();
-    bool _gptBusy, _gptAuto = true;
-    bool[] _goBusy, _goAuto;
-    bool _ccBusy, _ccAuto = true;
     int _formH;
-    int _goRowCount;
-    GraphicsPath[][] _goBandPaths;
-    GraphicsPath[] _ccBandPaths;
+
+    internal sealed class SourceRow
+    {
+      public readonly Func<FetchResult> Fetch;
+      public readonly string Title;
+      public readonly int Y;
+      public readonly SolidBrush Dot;
+      public readonly GraphicsPath[][] Paths;
+      public FetchResult Result { get; private set; }
+      public bool Busy { get; private set; }
+      public bool Auto { get; private set; }
+      public bool FirstClick { get { return !Auto && Result.Error == null; } }
+      public string ActionText { get { return Busy ? null : FirstClick ? "获取额度" : Result.Error != null ? "重试" : null; } }
+
+      public SourceRow(string title, int y, SolidBrush dot, GraphicsPath[][] paths, Func<FetchResult> fetch, bool auto)
+      {
+        Title = title; Y = y; Dot = dot; Paths = paths; Fetch = fetch; Auto = auto;
+        Result = new FetchResult();
+      }
+
+      public bool TryStart(bool manual)
+      {
+        if (Busy || (!manual && !Auto)) return false;
+        Busy = true;
+        return true;
+      }
+
+      public void Apply(FetchResult result)
+      {
+        Busy = false;
+        Auto = result.Error == null;
+        if (Auto) Result = result;
+        else Result.Error = result.Error; // 保留上次成功数据和时间
+      }
+    }
 
     public MilkmanForm()
     {
       _cfg = Config.Load();
       _fetcher = new DataFetcher();
+      _sources.Add(new SourceRow("ChatGPT Plus", 12, BrAccent, GptBandPaths,
+        () => _fetcher.FetchGpt(_cfg.ChatGptAuthPath), false));
       foreach (var account in _cfg.OpenCodeAccounts)
-        _goAccounts.Add(new GoAccountSnapshot { Name = account.Name });
-      if (_cfg.OpenCodeAccounts.Count == 0) _goError = "未配置 OpenCode 账户";
-      _goBusy = new bool[_cfg.OpenCodeAccounts.Count];
-      _goAuto = new bool[_cfg.OpenCodeAccounts.Count];
-      for (int i = 0; i < _goAuto.Length; i++) _goAuto[i] = true;
-      _goRowCount = _cfg.OpenCodeAccounts.Count; // 列表留空 = 未订阅, 整块隐藏
-      _ccConfig = _cfg.CommandCode;              // 没写这一段 = 未订阅, 整块隐藏
-      int ccRows = _ccConfig != null ? 1 : 0;
-      _formH = 16 + (_goRowCount + 1 + ccRows) * GoRowH;
-      _goBandPaths = new GraphicsPath[_goRowCount][];
-      for (int row = 0; row < _goRowCount; row++)
-        _goBandPaths[row] = CreateBandPaths(GoFirstRowY + row * GoRowH + GoBandOffset, 3);
-      if (_ccConfig != null)
-        _ccBandPaths = CreateBandPaths(CcRowY + GoBandOffset, 3);
+        AddSource("OpenCode Go", account.Name, BrAccentOff, () => _fetcher.FetchGo(account));
+      var cc = _cfg.CommandCode;
+      if (cc != null) AddSource("Command Code", cc.Name, BrAccentCc, () => _fetcher.FetchCommandCode(cc));
+      _formH = 16 + _sources.Count * GoRowH;
 
       fontBig = new Font("Microsoft YaHei UI", 12f, FontStyle.Bold);
       fontMid = new Font("Microsoft YaHei UI", 9f, FontStyle.Regular);
@@ -987,14 +968,14 @@ namespace Milkman
       Shown += OnShownHook;
       Shown += (s, e) =>
       {
-        RefreshAll(true); // 句柄创建后再启动并行取数，确保结果能回到 UI 线程
+        RefreshAll(); // 句柄创建后再启动允许自动刷新的来源
         _refreshTimer.Start();
         _clockTimer.Start();
       };
       FormClosing += (s, e) => SaveState();
 
       _dockTimer = new Timer();
-      _dockTimer.Interval = 30;
+      _dockTimer.Interval = DockIdleMs;
       _dockTimer.Tick += (s, e) => DockTick();
 
       Load += (s, e) =>
@@ -1011,7 +992,7 @@ namespace Milkman
       };
 
       _refreshTimer.Interval = _cfg.RefreshSeconds * 1000;
-      _refreshTimer.Tick += (s, e) => RefreshAll(false);
+      _refreshTimer.Tick += (s, e) => RefreshAll();
       _clockTimer.Interval = 5000; // 与 DeepSeek 一致: 5s 周期重绘剩余时间
       _clockTimer.Tick += (s, e) =>
       {
@@ -1022,95 +1003,30 @@ namespace Milkman
 
     }
 
-    // 单个低频调度器触发彼此独立的后台任务；失败只关闭对应来源的 auto 标记
-    void RefreshAll(bool manual)
+    void AddSource(string provider, string name, SolidBrush dot, Func<FetchResult> fetch)
     {
-      bool started = StartGptRefresh(manual);
-      for (int i = 0; i < _cfg.OpenCodeAccounts.Count; i++)
-        started = StartGoRefresh(i, manual) || started;
-      started = StartCcRefresh(manual) || started;
+      int y = GoFirstRowY + (_sources.Count - 1) * GoRowH;
+      string title = string.IsNullOrEmpty(name) ? provider : provider + " · " + name;
+      _sources.Add(new SourceRow(title, y, dot, new[] { CreateBandPaths(y + GoBandOffset, 3) }, fetch, true));
+    }
+
+    void RefreshAll()
+    {
+      bool started = false;
+      foreach (var row in _sources) started = StartRefresh(row, false) || started;
       if (started) Invalidate();
     }
 
-    bool StartGptRefresh(bool manual)
+    bool StartRefresh(SourceRow row, bool manual)
     {
-      if (_gptBusy || (!manual && !_gptAuto)) return false;
-      _gptBusy = true;
+      if (!row.TryStart(manual)) return false;
       Task.Run(() =>
       {
-        var result = _fetcher.FetchGpt(_cfg.ChatGptAuthPath);
-        try { BeginInvoke((Action)(() => ApplyGptResult(result))); } catch { }
+        var result = row.Fetch();
+        try { BeginInvoke((Action)(() => { row.Apply(result); Invalidate(); })); }
+        catch (InvalidOperationException) { } // 窗口已关闭
       });
       return true;
-    }
-
-    void ApplyGptResult(GptFetchResult result)
-    {
-      _gptBusy = false;
-      _gptAuto = result.Error == null;
-      if (result.Error == null)
-        _gpt = result;
-      else
-        _gpt.Error = result.Error; // 保留上次成功数据，只更新错误状态
-      Invalidate();
-    }
-
-    bool StartGoRefresh(int index, bool manual)
-    {
-      if (index < 0 || index >= _goBusy.Length || _goBusy[index] || (!manual && !_goAuto[index])) return false;
-      _goBusy[index] = true;
-      OpenCodeAccountConfig cfg = _cfg.OpenCodeAccounts[index];
-      Task.Run(() =>
-      {
-        var result = _fetcher.FetchGo(cfg);
-        try { BeginInvoke((Action)(() => ApplyGoResult(index, result))); } catch { }
-      });
-      return true;
-    }
-
-    void ApplyGoResult(int index, GoAccountSnapshot result)
-    {
-      if (index < 0 || index >= _goAccounts.Count) return;
-      _goBusy[index] = false;
-      _goAuto[index] = result.Error == null;
-      GoAccountSnapshot current = _goAccounts[index];
-      if (result.Error == null)
-      {
-        current.Windows = result.Windows;
-        current.LastSuccess = result.LastSuccess;
-        current.Error = null;
-      }
-      else
-        current.Error = result.Error; // 仅暂停本账户，其他账户继续刷新
-      Invalidate();
-    }
-
-    bool StartCcRefresh(bool manual)
-    {
-      if (_ccConfig == null || _ccBusy || (!manual && !_ccAuto)) return false;
-      _ccBusy = true;
-      CommandCodeConfig cfg = _ccConfig;
-      Task.Run(() =>
-      {
-        var result = _fetcher.FetchCommandCode(cfg);
-        try { BeginInvoke((Action)(() => ApplyCcResult(result))); } catch { }
-      });
-      return true;
-    }
-
-    void ApplyCcResult(CommandCodeSnapshot result)
-    {
-      _ccBusy = false;
-      _ccAuto = result.Error == null;
-      if (result.Error == null)
-      {
-        _cc.Windows = result.Windows;
-        _cc.LastSuccess = result.LastSuccess;
-        _cc.Error = null;
-      }
-      else
-        _cc.Error = result.Error; // 仅暂停 Command Code，其他来源继续刷新
-      Invalidate();
     }
 
     // ---------------- 系统级拖动 + 顶部吸附（参照 DeepSeekTimeline） ----------------
@@ -1179,7 +1095,7 @@ namespace Milkman
         int sx = lp & 0xFFFF; if (sx >= 0x8000) sx -= 0x10000;
         int sy = (lp >> 16) & 0xFFFF; if (sy >= 0x8000) sy -= 0x10000;
         Point pt = PointToClient(new Point(sx, sy));
-        m.Result = (IntPtr)(closeRect.Contains(pt) || RetryHit(pt) != NoRetry ? HTCLIENT : HTCAPTION);
+        m.Result = (IntPtr)(closeRect.Contains(pt) || ActionHit(pt) != null ? HTCLIENT : HTCAPTION);
         return;
       }
       // 拦截"标题栏双击": 吸附(docked)时切换 Pin(钉住), 非吸附时双击无效果
@@ -1217,29 +1133,34 @@ namespace Milkman
     {
       if (e.Button != MouseButtons.Left) return;
       if (closeRect.Contains(e.Location)) { Close(); return; } // ✕ = 退出程序
-      int retry = RetryHit(e.Location);
-      if (retry != NoRetry) RetryAt(retry);
+      var row = ActionHit(e.Location);
+      if (row != null && StartRefresh(row, true))
+      {
+        _hoverAction = null;
+        Cursor = Cursors.Default;
+        Invalidate();
+      }
     }
 
     void OnMouseMoveHook(object sender, MouseEventArgs e)
     {
       bool h = closeRect.Contains(e.Location);
-      int retry = RetryHit(e.Location);
-      if (h != hoverClose || retry != _hoverRetry)
+      var row = ActionHit(e.Location);
+      if (h != hoverClose || row != _hoverAction)
       {
         hoverClose = h;
-        _hoverRetry = retry;
-        Cursor = h || retry != NoRetry ? Cursors.Hand : Cursors.Default;
+        _hoverAction = row;
+        Cursor = h || row != null ? Cursors.Hand : Cursors.Default;
         Invalidate();
       }
     }
 
     void OnMouseLeaveHook(object sender, EventArgs e)
     {
-      if (hoverClose || _hoverRetry != NoRetry)
+      if (hoverClose || _hoverAction != null)
       {
         hoverClose = false;
-        _hoverRetry = NoRetry;
+        _hoverAction = null;
         Cursor = Cursors.Default;
         Invalidate();
       }
@@ -1334,17 +1255,19 @@ namespace Milkman
       }
       else if (expanded)
       {
-        expanded = false; // 离开立即收起（与 DeepSeek 一致, 零延迟）
+        expanded = false; // 检测到离开即开始收起，无额外等待
       }
       int target = expanded ? monRect.Top : monRect.Top - _formH + Peek;
-      if (Top != target)
+      if (wr.Top != target)
       {
-        int dy = target - Top;
+        int dy = target - wr.Top;
         int step = dy / 3;
         if (step == 0) step = dy > 0 ? 1 : -1;
-        NativeMethods.SetWindowPos(Handle, IntPtr.Zero, Left, Top + step, 0, 0,
+        NativeMethods.SetWindowPos(Handle, IntPtr.Zero, wr.Left, wr.Top + step, 0, 0,
           0x0001 | 0x0004 | 0x0010); // NOSIZE | NOZORDER | NOACTIVATE
       }
+      int interval = Top == target ? DockIdleMs : DockAnimationMs;
+      if (_dockTimer.Interval != interval) _dockTimer.Interval = interval;
     }
 
     // 前台程序全屏(视频/游戏)时不弹出, 防干扰
@@ -1393,37 +1316,17 @@ namespace Milkman
       return p;
     }
 
-    Rectangle RetryButtonRect(int rowY)
+    static Rectangle ActionRect(SourceRow row)
     {
-      return new Rectangle(W - 76, rowY + 1, 48, 22);
+      int width = row.FirstClick ? 80 : 48;
+      return new Rectangle(W - 28 - width, row.Y + 1, width, 22);
     }
 
-    // Command Code 区块的行位置: 紧跟最后一个 OpenCode 账户
-    int CcRowY { get { return GoFirstRowY + _goRowCount * GoRowH; } }
-
-    int RetryHit(Point p)
+    SourceRow ActionHit(Point p)
     {
-      if (_gpt.Error != null && !_gptBusy && RetryButtonRect(12).Contains(p))
-        return GptRetry;
-      for (int row = 0; row < _goAccounts.Count && row < _goBusy.Length; row++)
-        if (_goAccounts[row].Error != null && !_goBusy[row] && RetryButtonRect(GoFirstRowY + row * GoRowH).Contains(p))
-          return row;
-      if (_ccConfig != null && _cc.Error != null && !_ccBusy && RetryButtonRect(CcRowY).Contains(p))
-        return CcRetry;
-      return NoRetry;
-    }
-
-    void RetryAt(int retry)
-    {
-      bool started = retry == GptRetry ? StartGptRefresh(true)
-        : retry == CcRetry ? StartCcRefresh(true)
-        : StartGoRefresh(retry, true);
-      if (started)
-      {
-        _hoverRetry = NoRetry;
-        Cursor = hoverClose ? Cursors.Hand : Cursors.Default;
-        Invalidate();
-      }
+      foreach (var row in _sources)
+        if (row.ActionText != null && ActionRect(row).Contains(p)) return row;
+      return null;
     }
 
     string SourceStatus(bool busy, string error, DateTime lastSuccess)
@@ -1447,29 +1350,34 @@ namespace Milkman
       return text.Substring(0, low) + "…";
     }
 
-    void DrawBlockHead(Graphics g, int rowY, SolidBrush dot, string title, string status, bool error, bool busy, bool retry, bool hoverRetry)
+    void DrawBlockHead(Graphics g, SourceRow row)
     {
-      g.FillEllipse(dot, 22, rowY + 7, 9, 9);
+      int rowY = row.Y;
+      bool error = row.Result.Error != null, busy = row.Busy;
+      string title = row.Title, action = row.ActionText;
+      string status = SourceStatus(busy, row.Result.Error, row.Result.LastSuccess);
+      g.FillEllipse(row.Dot, 22, rowY + 7, 9, 9);
       g.DrawString(title, fontBig, BrText, 40, rowY - 1);
       if (!string.IsNullOrEmpty(status))
       {
         SolidBrush brush = error && !busy ? BrRed : busy ? BrSub : BrFaint;
-        int right = retry ? RetryButtonRect(rowY).Left - 8 : W - 20;
+        int right = action != null ? ActionRect(row).Left - 8 : W - 20;
         float room = right - 40 - Wd(g, title, fontBig) - 8;
         // 放不下的错误长文退回落款，完整原因由空数据行承担，避免标题行出现半截文字
         if (error && !busy && Wd(g, status, fontMid) > room) status = "无法获取信息";
         g.DrawString(status, fontMid, brush, right - Wd(g, status, fontMid), rowY + 3);
       }
-      if (retry)
+      if (action != null)
       {
-        Rectangle r = RetryButtonRect(rowY);
+        bool hot = row == _hoverAction;
+        Rectangle r = ActionRect(row);
         using (GraphicsPath p = RoundedRect(r, 5f))
         {
-          g.FillPath(hoverRetry ? BrAccent : BrTrack, p);
-          g.DrawPath(hoverRetry ? PenCloseHot : PenBarBorder, p);
+          g.FillPath(hot ? BrAccent : BrTrack, p);
+          g.DrawPath(hot ? PenCloseHot : PenBarBorder, p);
         }
-        g.DrawString("重试", fontMid, hoverRetry ? BrBg : BrText,
-          r.Left + (r.Width - Wd(g, "重试", fontMid)) / 2f, r.Top + 3);
+        g.DrawString(action, fontMid, hot ? BrBg : BrText,
+          r.Left + (r.Width - Wd(g, action, fontMid)) / 2f, r.Top + 3);
       }
     }
 
@@ -1527,42 +1435,12 @@ namespace Milkman
       g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAlias;
       g.Clear(Bg);
 
-      // ---- 块1: ChatGPT Plus (按实际额度窗口数分段) ----
-      DrawBlockHead(g, 12, BrAccent, "ChatGPT Plus",
-        SourceStatus(_gptBusy, _gpt.Error, _gpt.LastSuccess), _gpt.Error != null, _gptBusy,
-        _gpt.Error != null && !_gptBusy, _hoverRetry == GptRetry);
-      int gptCount = Math.Max(1, Math.Min(3, _gpt.Windows.Count));
-      DrawWindows(g, _gpt.Windows, GptBandPaths[gptCount - 1], BandTop1, _gpt.Error);
-
-      // ---- 块2+: 每个 OpenCode Go 账户一行，每行 5h/周/月三窗口 ----
-      for (int row = 0; row < _goRowCount; row++)
+      foreach (var row in _sources)
       {
-        int rowY = GoFirstRowY + row * GoRowH;
-        int bandY = rowY + GoBandOffset;
-        GoAccountSnapshot account = row < _goAccounts.Count ? _goAccounts[row] : null;
-        string name = account != null ? account.Name
-          : row < _cfg.OpenCodeAccounts.Count ? _cfg.OpenCodeAccounts[row].Name : "";
-        string title = string.IsNullOrEmpty(name) ? "OpenCode Go" : "OpenCode Go · " + name;
-        bool hasError = account != null ? account.Error != null : _goError != null;
-        bool busy = row < _goBusy.Length && _goBusy[row];
-        DateTime lastSuccess = account != null ? account.LastSuccess : default(DateTime);
-        string error = account != null ? account.Error : _goError;
-        DrawBlockHead(g, rowY, BrAccentOff, title,
-          SourceStatus(busy, error, lastSuccess), hasError, busy,
-          account != null && error != null && !busy, _hoverRetry == row);
-
-        DrawWindows(g, account != null ? account.Windows : null, _goBandPaths[row], bandY, error);
-      }
-
-      // ---- 最后一段: Command Code（GOAT / Pro 等套餐），未配置时不占版位 ----
-      if (_ccConfig != null)
-      {
-        string name = _ccConfig.Name;
-        string title = string.IsNullOrEmpty(name) ? "Command Code" : "Command Code · " + name;
-        DrawBlockHead(g, CcRowY, BrAccentCc, title,
-          SourceStatus(_ccBusy, _cc.Error, _cc.LastSuccess), _cc.Error != null, _ccBusy,
-          _cc.Error != null && !_ccBusy, _hoverRetry == CcRetry);
-        DrawWindows(g, _cc.Windows, _ccBandPaths, CcRowY + GoBandOffset, _cc.Error);
+        DrawBlockHead(g, row);
+        var windows = row.Result.Windows;
+        int path = Math.Max(0, Math.Min(row.Paths.Length, windows.Count) - 1);
+        DrawWindows(g, windows, row.Paths[path], row.Y + GoBandOffset, row.Result.Error);
       }
 
       // ---- 关闭按钮 ----
