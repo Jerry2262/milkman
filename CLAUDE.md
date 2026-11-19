@@ -32,13 +32,13 @@ powershell.exe -NoProfile -Command 'Start-Process "$env:LOCALAPPDATA\Milkman\Mil
 
 ## 架构（单文件 Main.cs，按 region 组织）
 
-- `Program` — 入口；TLS1.2 显式设置（.NET 4.x 默认不协商，必踩坑）；写自启注册表；`DataDir()` = `%LOCALAPPDATA%\Milkman`
+- `Program` — 入口；检查自启注册表；`DataDir()` = `%LOCALAPPDATA%\Milkman`
 - `Config` — 显式字段映射读写 `config.json`（窗口 X/Y、Docked、RefreshSeconds、ChatGptAuthPath、OpenCodeAccounts、CommandCode）；程序固定开机自启，不设配置开关；解析失败回落默认并备份 `config.json.bad`；新增字段需同步 `Parse()` / `ToDictionary()`，否则会静默读不到/存不住
 - `DataFetcher` — 无状态网络层；`FetchGpt()`、每个 `FetchGo(account)` 与 `FetchCommandCode(cfg)` 可并行调用；JSON 字段统一安全读取，轻量 JSON 值树逐调用独立解析，不依赖 ASP.NET 或共享序列化器锁；错误消息截断 80 字
 - `MilkmanForm` — 自绘 UI + 行为：
   - 版式：宽 520，高度 = `16 + (行数 + 1) × GoRowH(76)`，行数 = OpenCode 账户数 +（配置了 `CommandCode` 则 +1）；`OpenCodeAccounts` 留空、`CommandCode` 为 null 都表示未订阅、对应区块隐藏；ChatGPT 按实际窗口数分 1–3 段；Brush/Pen/BandPath 缓存复用，低频动态文本直接测量，禁止缓存不断变化的倒计时字符串
   - 吸附：`WM_NCHITTEST`→`HTCAPTION` 系统级拖动；`WM_ENTERSIZEMOVE/EXITSIZEMOVE` 判定出入吸附（Top≤monTop+8 吸附，>monTop+30 脱离）；静止时 `DockTick` 每 100ms 采样，滑动用 30ms 缓出（dy/3，`Peek=5`）；双击 Pin 后立即展开并停止 DockTimer，取消 Pin 时恢复
-  - 独立刷新：每个 `SourceRow` 维护自己的 busy/auto/error/last-success，共用 `_refreshTimer`、后台派发、绘制和点击命中逻辑。ChatGPT 初始等待点击「获取额度」，成功才进入定时刷新；失败只暂停自身并保留旧数据，单击该行「重试」恢复。
+  - 独立刷新：每个 `SourceRow` 维护自己的 busy/auto/error/last-success，共用 `_refreshTimer`、后台派发、绘制和点击命中逻辑。每次启动等待一次「获取全部额度」；点击后为 HTTPS 启用 TLS 1.2，并发加载所有已配置来源，成功的来源进入定时刷新；失败只暂停自身并保留旧数据，单击该行「重试」恢复。
   - 置顶：`TopMost = true` 只让 WinForms 在**创建之后**用 `SetWindowPos` 补设一层，而后台启动（开机自启、被别的进程拉起）时这个调用会被系统的 z-order 前台锁静默忽略——窗口就永远不置顶，表现为"有时置顶有时不置顶"。所以 `CreateParams` 里直接带 `WS_EX_TOPMOST`，窗口创建即置顶，与是否前台无关；`EnsureTopMost()` 再在 `WM_WINDOWPOSCHANGED` / `WM_STYLECHANGED(GWL_EXSTYLE)` 与 `OnShown` 后补一次丢失的标志（不轮询、不抢焦点）
   - 多屏：`monRect` 可能为负坐标屏（副屏在顶部），坐标计算要考虑
 - `Json` — 同文件内的标准 JSON 读写；保留未知授权字段的数字词法，避免装载 ASP.NET。改动 `Json` / `Config` / 响应解析后必须跑 `tests\run.bat`（仅合成数据）。

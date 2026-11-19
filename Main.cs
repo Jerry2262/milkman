@@ -24,8 +24,6 @@ namespace Milkman
     [STAThread]
     static void Main()
     {
-      // .NET Framework 4.x 默认不协商 TLS1.2+，而 chatgpt.com 已不支持旧协议
-      try { System.Net.ServicePointManager.SecurityProtocol = System.Net.SecurityProtocolType.Tls12; } catch { }
       NativeMethods.SetProcessDPIAware();
       Application.EnableVisualStyles();
       Application.SetCompatibleTextRenderingDefault(false);
@@ -135,15 +133,16 @@ namespace Milkman
       return new Config { OpenCodeAccounts = DefaultOpenCodeAccounts() };
     }
 
-    public void Save()
+    public bool Save()
     {
       try
       {
         Directory.CreateDirectory(Program.DataDir());
         File.WriteAllText(Path.Combine(Program.DataDir(), "config.json"),
           Json.Serialize(ToDictionary()), new UTF8Encoding(false));
+        return true;
       }
-      catch { }
+      catch { return false; }
     }
 
     public static Config Parse(string json)
@@ -889,7 +888,7 @@ namespace Milkman
 
     Config _cfg;
     DataFetcher _fetcher;
-    readonly List<SourceRow> _sources = new List<SourceRow>();
+    readonly RefreshSession _refresh;
     Timer _refreshTimer = new Timer();
     Timer _clockTimer = new Timer();
     int _formH;
@@ -904,12 +903,10 @@ namespace Milkman
       public FetchResult Result { get; private set; }
       public bool Busy { get; private set; }
       public bool Auto { get; private set; }
-      public bool FirstClick { get { return !Auto && Result.Error == null; } }
-      public string ActionText { get { return Busy ? null : FirstClick ? "获取额度" : Result.Error != null ? "重试" : null; } }
 
-      public SourceRow(string title, int y, SolidBrush dot, GraphicsPath[][] paths, Func<FetchResult> fetch, bool auto)
+      public SourceRow(string title, int y, SolidBrush dot, GraphicsPath[][] paths, Func<FetchResult> fetch)
       {
-        Title = title; Y = y; Dot = dot; Paths = paths; Fetch = fetch; Auto = auto;
+        Title = title; Y = y; Dot = dot; Paths = paths; Fetch = fetch;
         Result = new FetchResult();
       }
 
@@ -929,17 +926,63 @@ namespace Milkman
       }
     }
 
+    // 仅 UI 线程驱动状态；派发后无需等待其他行完成。
+    internal sealed class RefreshSession
+    {
+      public readonly List<SourceRow> Rows = new List<SourceRow>();
+      readonly Action<SourceRow> dispatch;
+      readonly Action enableNetwork;
+      public bool Started { get; private set; }
+      public RefreshSession(Action enableNetwork, Action<SourceRow> dispatch)
+      {
+        this.enableNetwork = enableNetwork;
+        this.dispatch = dispatch;
+      }
+      public string ActionText(SourceRow row)
+      {
+        if (!Started) return row == Rows[0] ? "获取全部额度" : null;
+        return !row.Busy && row.Result.Error != null ? "重试" : null;
+      }
+      public bool Click(SourceRow row)
+      {
+        if (ActionText(row) == null) return false;
+        if (!Started)
+        {
+          Started = true;
+          enableNetwork();
+          foreach (var source in Rows) if (source.TryStart(true)) dispatch(source);
+        }
+        else if (row.TryStart(true)) dispatch(row);
+        return true;
+      }
+      public bool RefreshDue()
+      {
+        bool any = false;
+        foreach (var row in Rows)
+          if (row.TryStart(false)) { dispatch(row); any = true; }
+        return any;
+      }
+      public bool HasCountdown(long now)
+      {
+        foreach (var row in Rows)
+          foreach (var w in row.Result.Windows)
+            if (w != null && !w.NotStarted && !w.Unlimited && w.ResetMs > now) return true;
+        return false;
+      }
+    }
+
     public MilkmanForm()
     {
+      _refresh = new RefreshSession(EnableNetwork, DispatchRefresh);
       _cfg = Config.Load();
       _fetcher = new DataFetcher();
-      _sources.Add(new SourceRow("ChatGPT Plus", 12, BrAccent, GptBandPaths,
-        () => _fetcher.FetchGpt(_cfg.ChatGptAuthPath), false));
+      _refresh.Rows.Add(new SourceRow("ChatGPT Plus", 12, BrAccent, GptBandPaths,
+        () => _fetcher.FetchGpt(_cfg.ChatGptAuthPath)));
       foreach (var account in _cfg.OpenCodeAccounts)
         AddSource("OpenCode Go", account.Name, BrAccentOff, () => _fetcher.FetchGo(account));
       var cc = _cfg.CommandCode;
       if (cc != null) AddSource("Command Code", cc.Name, BrAccentCc, () => _fetcher.FetchCommandCode(cc));
-      _formH = 16 + _sources.Count * GoRowH;
+      _formH = 16 + _refresh.Rows.Count * GoRowH;
 
       fontBig = new Font("Microsoft YaHei UI", 12f, FontStyle.Bold);
       fontMid = new Font("Microsoft YaHei UI", 9f, FontStyle.Regular);
@@ -966,12 +1009,6 @@ namespace Milkman
       MouseLeave += OnMouseLeaveHook;
       MouseDown += OnMouseDownHook;
       Shown += OnShownHook;
-      Shown += (s, e) =>
-      {
-        RefreshAll(); // 句柄创建后再启动允许自动刷新的来源
-        _refreshTimer.Start();
-        _clockTimer.Start();
-      };
       FormClosing += (s, e) => SaveState();
 
       _dockTimer = new Timer();
@@ -992,41 +1029,46 @@ namespace Milkman
       };
 
       _refreshTimer.Interval = _cfg.RefreshSeconds * 1000;
-      _refreshTimer.Tick += (s, e) => RefreshAll();
+      _refreshTimer.Tick += (s, e) => { if (_refresh.RefreshDue()) RepaintUsage(); };
       _clockTimer.Interval = 5000; // 与 DeepSeek 一致: 5s 周期重绘剩余时间
       _clockTimer.Tick += (s, e) =>
       {
-        // 完全收起时可见区只有 5px 静态边条, 跳过无效重绘
-        if (docked && !expanded && Top <= monRect.Top - _formH + Peek) return;
-        Invalidate();
+        RepaintUsage(); // 包括倒计时刚结束的最后一次重绘
+        _clockTimer.Enabled = _refresh.HasCountdown(Program.NowUnixMs());
       };
 
     }
 
     void AddSource(string provider, string name, SolidBrush dot, Func<FetchResult> fetch)
     {
-      int y = GoFirstRowY + (_sources.Count - 1) * GoRowH;
+      int y = GoFirstRowY + (_refresh.Rows.Count - 1) * GoRowH;
       string title = string.IsNullOrEmpty(name) ? provider : provider + " · " + name;
-      _sources.Add(new SourceRow(title, y, dot, new[] { CreateBandPaths(y + GoBandOffset, 3) }, fetch, true));
+      _refresh.Rows.Add(new SourceRow(title, y, dot, new[] { CreateBandPaths(y + GoBandOffset, 3) }, fetch));
     }
 
-    void RefreshAll()
+    void RepaintUsage()
     {
-      bool started = false;
-      foreach (var row in _sources) started = StartRefresh(row, false) || started;
-      if (started) Invalidate();
+      if (!docked || expanded || Top > monRect.Top - _formH + Peek) Invalidate();
     }
 
-    bool StartRefresh(SourceRow row, bool manual)
+    static void EnableNetwork()
     {
-      if (!row.TryStart(manual)) return false;
+      try { ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12; } catch { }
+    }
+
+    void DispatchRefresh(SourceRow row)
+    {
       Task.Run(() =>
       {
         var result = row.Fetch();
-        try { BeginInvoke((Action)(() => { row.Apply(result); Invalidate(); })); }
+        try { BeginInvoke((Action)(() => {
+          row.Apply(result);
+          _refreshTimer.Enabled = _refresh.Rows.Exists(r => r.Auto);
+          _clockTimer.Enabled = _refresh.HasCountdown(Program.NowUnixMs());
+          RepaintUsage();
+        })); }
         catch (InvalidOperationException) { } // 窗口已关闭
       });
-      return true;
     }
 
     // ---------------- 系统级拖动 + 顶部吸附（参照 DeepSeekTimeline） ----------------
@@ -1114,7 +1156,6 @@ namespace Milkman
           }
           else
             _dockTimer.Start();
-          SaveState();
           Invalidate();
         }
         m.Result = IntPtr.Zero;
@@ -1134,7 +1175,7 @@ namespace Milkman
       if (e.Button != MouseButtons.Left) return;
       if (closeRect.Contains(e.Location)) { Close(); return; } // ✕ = 退出程序
       var row = ActionHit(e.Location);
-      if (row != null && StartRefresh(row, true))
+      if (row != null && _refresh.Click(row))
       {
         _hoverAction = null;
         Cursor = Cursors.Default;
@@ -1228,11 +1269,11 @@ namespace Milkman
 
     void SaveState()
     {
-      var cfg = Config.Load();
-      cfg.X = Location.X;
-      cfg.Y = docked ? monRect.Top : Location.Y;
-      cfg.Docked = docked;
-      cfg.Save();
+      int x = Left, y = docked ? monRect.Top : Top;
+      if (_cfg.X == x && _cfg.Y == y && _cfg.Docked == docked) return;
+      var cfg = Config.Load(); // 只在位置变化时重读，保留运行期间手改的账户配置
+      cfg.X = x; cfg.Y = y; cfg.Docked = docked;
+      if (cfg.Save()) { _cfg.X = x; _cfg.Y = y; _cfg.Docked = docked; }
     }
 
     // 吸附模式核心: 鼠标感应 + 缓出滑动动画
@@ -1316,16 +1357,16 @@ namespace Milkman
       return p;
     }
 
-    static Rectangle ActionRect(SourceRow row)
+    Rectangle ActionRect(SourceRow row)
     {
-      int width = row.FirstClick ? 80 : 48;
+      int width = _refresh.Started ? 48 : 100;
       return new Rectangle(W - 28 - width, row.Y + 1, width, 22);
     }
 
     SourceRow ActionHit(Point p)
     {
-      foreach (var row in _sources)
-        if (row.ActionText != null && ActionRect(row).Contains(p)) return row;
+      foreach (var row in _refresh.Rows)
+        if (_refresh.ActionText(row) != null && ActionRect(row).Contains(p)) return row;
       return null;
     }
 
@@ -1354,7 +1395,7 @@ namespace Milkman
     {
       int rowY = row.Y;
       bool error = row.Result.Error != null, busy = row.Busy;
-      string title = row.Title, action = row.ActionText;
+      string title = row.Title, action = _refresh.ActionText(row);
       string status = SourceStatus(busy, row.Result.Error, row.Result.LastSuccess);
       g.FillEllipse(row.Dot, 22, rowY + 7, 9, 9);
       g.DrawString(title, fontBig, BrText, 40, rowY - 1);
@@ -1435,7 +1476,7 @@ namespace Milkman
       g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAlias;
       g.Clear(Bg);
 
-      foreach (var row in _sources)
+      foreach (var row in _refresh.Rows)
       {
         DrawBlockHead(g, row);
         var windows = row.Result.Windows;

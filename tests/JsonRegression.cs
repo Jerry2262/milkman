@@ -68,25 +68,34 @@ static class JsonRegression
         } finally { System.IO.Directory.Delete(dir,true); }
     }
     static void CheckRefreshRows() {
-        var gpt = new MilkmanForm.SourceRow("ChatGPT", 12, null, null, null, false);
-        var go = new MilkmanForm.SourceRow("Go", 88, null, null, null, true);
-        var cc = new MilkmanForm.SourceRow("CC", 164, null, null, null, true);
-        Check(gpt.ActionText == "获取额度" && !gpt.TryStart(false), "ChatGPT waits for the first click");
-        Check(go.TryStart(false) && cc.TryStart(false), "other sources start automatically");
-        Check(gpt.TryStart(true) && gpt.ActionText == null && !gpt.TryStart(true) && !gpt.TryStart(false), "first click starts only one fetch");
-        var error = new FetchResult { Error = "synthetic timeout" };
-        gpt.Apply(error);
-        Check(gpt.ActionText == "重试" && !gpt.TryStart(false) && gpt.TryStart(true), "first failure switches to manual retry");
-        var success = new FetchResult { LastSuccess = DateTime.Now };
-        success.Windows.Add(new UsageWindow { Label = "5h" });
-        gpt.Apply(success);
-        Check(gpt.ActionText == null && gpt.TryStart(false), "first success enables automatic refresh");
-        gpt.Apply(error);
-        Check(!gpt.TryStart(false) && gpt.Result.Windows[0].Label == "5h"
-            && gpt.Result.LastSuccess == success.LastSuccess, "failed refresh retains the last successful data");
-        go.Apply(new FetchResult(true));
-        cc.Apply(new FetchResult(true));
-        Check(go.TryStart(false) && cc.TryStart(false), "failure only pauses its own row");
+        int network = 0;
+        var dispatched = new List<MilkmanForm.SourceRow>();
+        var session = new MilkmanForm.RefreshSession(() => network++, dispatched.Add);
+        foreach (var title in new[] { "ChatGPT", "Go A", "Go B", "CC" })
+            session.Rows.Add(new MilkmanForm.SourceRow(title, 0, null, null, null));
+        var first = session.Rows[0];
+        Check(!session.RefreshDue() && network == 0 && dispatched.Count == 0
+            && session.Rows.FindAll(r => session.ActionText(r) != null).Count == 1
+            && session.ActionText(first) == "获取全部额度", "startup waits for one shared action");
+        Check(session.Click(first) && !session.Click(first) && network == 1
+            && dispatched.Count == session.Rows.Count && session.Rows.TrueForAll(r => r.Busy && dispatched.Contains(r)),
+            "first click dispatches every configured source once");
+        var cached = new FetchResult { LastSuccess = DateTime.Now };
+        cached.Windows.Add(new UsageWindow { ResetMs = 1000 });
+        first.Apply(cached);
+        var failed = session.Rows[1];
+        failed.Apply(new FetchResult { Error = "timeout" });
+        dispatched.Clear();
+        Check(session.RefreshDue() && dispatched.Count == 1 && dispatched[0] == first,
+            "scheduled refresh skips busy and failed sources");
+        dispatched.Clear();
+        Check(session.ActionText(failed) == "重试" && session.Click(failed) && network == 1
+            && dispatched.Count == 1 && dispatched[0] == failed, "retry dispatches only the failed row");
+        first.Apply(new FetchResult { Error = "timeout" });
+        failed.Apply(new FetchResult(true));
+        dispatched.Clear();
+        Check(session.RefreshDue() && dispatched.Count == 1 && dispatched[0] == failed && first.Result == cached
+            && session.HasCountdown(999) && !session.HasCountdown(1000), "recovered row resumes and stale data counts down until expiry");
     }
     static void Main() {
         CheckRefreshRows();
