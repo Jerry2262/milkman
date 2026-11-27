@@ -447,7 +447,7 @@ namespace Milkman
       ApplyScale();
       // 配置里的吸附状态只在目标屏仍允许吸附时沿用，否则回到常规位置
       bool canDock = _cfg.Docked && DockableOn(monRect);
-      if (_cfg.Docked && !canDock) docked = false;
+      docked = canDock;   // 必须显式置 true，否则配置里的 Docked 永远不会生效
       if (_cfg.OffsetX < 0 || _cfg.OffsetY < 0)
       {
         // 首次运行或旧配置：靠右下角摆放

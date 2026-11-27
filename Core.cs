@@ -25,8 +25,12 @@ namespace Milkman
       Application.Run(new MilkmanForm());
     }
 
+    // 数据目录。场景验收脚本用 MILKMAN_DATA_DIR 指向临时目录，从而完全不碰真实配置；
+    // GetFolderPath 不读环境变量，只认系统已知文件夹，所以这里必须显式支持覆盖。
     public static string DataDir()
     {
+      string overridden = Environment.GetEnvironmentVariable("MILKMAN_DATA_DIR");
+      if (!string.IsNullOrEmpty(overridden)) return overridden;
       return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Milkman");
     }
 

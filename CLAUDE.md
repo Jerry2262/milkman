@@ -20,6 +20,10 @@ build.bat
 # 回归检查（Windows cmd 中运行；仅合成数据，不读真实凭据、不请求 API；改任意源文件后必跑）
 tests\run.bat
 
+# 场景验收（真实启动浮窗并按常见用法驱动，逐个截图供人工/视觉检查；
+# 数据目录靠 MILKMAN_DATA_DIR 隔离，不碰真实配置；会短暂改写自启项，结束时还原）
+powershell -NoProfile -ExecutionPolicy Bypass -File tests\scenarios.ps1 -OutDir %TEMP%\milkman-scn
+
 # 从 WSL 手动编译（/out 必须是 Windows 本地路径，源码路径用 wslpath 转换）
 /mnt/c/Windows/Microsoft.NET/Framework64/v4.0.30319/csc.exe /nologo /target:winexe /platform:anycpu \
   /r:System.dll /r:System.Core.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll \
@@ -62,4 +66,5 @@ powershell.exe -NoProfile -Command 'Start-Process "$env:LOCALAPPDATA\Milkman\Mil
 6. **config.json 边界**：解析器只接受标准 JSON（单引号、无引号键会被拒绝）；`null` 数值字段回落默认值，`RefreshSeconds` ≤0 或换算为毫秒会溢出时回落 60；解析失败会把原文件备份为 `config.json.bad` 并回落默认配置；`OpenCodeAccounts` 里的 null 元素会被忽略
 7. **Command Code 响应坑**：`windowLimits.*.resetAt` 是 epoch 毫秒、0 表示滚动窗口尚未开始（显示“未开始”）；`monthlyCredits` 是**剩余**不是已用；`monthlyCreditsGranted` 可能不返回，缺它时月度分母靠套餐表兜底（`individual-goat`=70），套餐也取不到就只在月度版位显示 `—`；`/alpha/*` 是 CLI 内部接口，字段随时可能变
 8. **refresh_token 一次性**：`oauth/token` 每刷新一次就换发新的 `refresh_token` 并作废旧的，响应里的 `refresh_token` / `id_token` 必须和 `access_token` 一起写回。只写 `access_token` 会让文件里的 RT 变成废的，且症状要等 access_token 到期（约 10 天）才出现——表现为 `刷新失败: refresh_token_reused`，只能重新登录。多台机器也别共用同一份 `auth.json`
-9. **改配置文件只用程序自己的写入路径**：手工改写 `config.json` 时用无 BOM 的 UTF-8。PowerShell 5 的 `Set-Content -Encoding UTF8` 会写 BOM，中文账户名会被写坏（曾实际发生过）。`tests/JsonRegression.cs` 的 `CheckConfigEncoding` 守着这条
+9. **场景验收脚本的坑**：`tests/scenarios.ps1` 必须存成**带 BOM** 的 UTF-8（PowerShell 5 会把无 BOM 的脚本按 GBK 解析，中文字符串直接语法错误）；脚本自身要先 `SetThreadDpiAwarenessContext(-4)`，否则 `GetWindowRect` 拿到的是虚拟化坐标，在 150% 屏上量出的尺寸只有实际的 2/3，点击也会点偏；不要从临时目录启动新编译的 exe（Defender 会拦截未签名的临时可执行文件），直接启动已部署的那份，靠 `MILKMAN_DATA_DIR` 隔离数据目录。
+10. **改配置文件只用程序自己的写入路径**：手工改写 `config.json` 时用无 BOM 的 UTF-8。PowerShell 5 的 `Set-Content -Encoding UTF8` 会写 BOM，中文账户名会被写坏（曾实际发生过）。`tests/JsonRegression.cs` 的 `CheckConfigEncoding` 守着这条
