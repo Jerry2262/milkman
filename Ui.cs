@@ -56,6 +56,8 @@ namespace Milkman
 
     // 注脚文字基线相对 row3 顶部的偏移
     const int MetaBaseline = 0;
+    // 注脚左段与右段之间的最小间隙
+    const int MetaGap = 6;
 
     // ---------------- 绘制基础 ----------------
     // 文字按物理像素绘制并绕开画布缩放：字形由 GDI+ 按最终尺寸微调，不会被压缩变换破坏。
@@ -67,10 +69,11 @@ namespace Milkman
     void DrawText(Graphics g, string s, Font f, Brush b, float x, float y)
     {
       if (string.IsNullOrEmpty(s)) return;
-      Matrix m = g.Transform;
+      Matrix m = g.Transform; // 这是副本，必须自己释放
       g.ResetTransform();
       g.DrawString(s, f, b, x * _scale, y * _scale);
       g.Transform = m;
+      m.Dispose();
     }
 
     // 垂直居中绘制：cy 是期望的文字视觉中心
@@ -159,17 +162,22 @@ namespace Milkman
     // 成功/获取中都没有按钮，状态右端可以用到按钮右端，因此「更新于 HH:mm:ss」放得下。
     string SourceStatus(bool busy, string error, DateTime lastSuccess)
     {
-      if (error != null && !busy) return "";
       if (busy) return lastSuccess == default(DateTime) ? "获取中" : "刷新中";
+      // 从没成功过：原因由第三行整行显示，第一行留白
+      if (error != null && lastSuccess == default(DateTime)) return "";
+      // 有旧数据但这次刷新失败：第三行还在显示旧数据，错误原因没有别的落点，
+      // 这里给一个短状态，避免用户只看到「重试」却不知道发生了什么
+      if (error != null) return "获取失败";
       return lastSuccess == default(DateTime) ? "" : "更新于 " + lastSuccess.ToString("HH:mm:ss");
     }
 
     // 一条用量条的左右两段文案
     // 注脚两段文案。每段可用宽度约 103px（96 DPI），"重置 " 前缀占 27px 会把最宽的一组挤到溢出，
     // 因此省掉前缀：左段「5h 14%」，右段「1h33m」。右段为空表示无需显示。
-    static void BandTexts(UsageWindow window, out string left, out string right)
+    static void BandTexts(UsageWindow window, out string label, out string pct, out string right)
     {
-      left = window.Label + " " + (window.Unlimited ? "∞" : (int)(window.UsedPct * 100) + "%");
+      label = window.Label ?? "";
+      pct = window.Unlimited ? "∞" : (int)(window.UsedPct * 100) + "%";
       right = window.Unlimited ? ""
         : window.NotStarted ? "未开始"
         : window.ResetMs > 0 ? FormatRemaining(window.ResetMs) : "";
@@ -213,7 +221,9 @@ namespace Milkman
       }
 
       // 标题从内容左边界起，可用空间扣掉状态占位；放不下就截断
-      float titleRoom = statusW > 0 ? statusRight - TitleLeft - BtnGap - statusW : RightEdge - TitleLeft;
+      // 有按钮时标题最远只能到按钮左侧；无按钮时可以用到状态右端或内容右边界
+      float titleRight = action != null ? act.Left - BtnGap : (statusW > 0 ? statusRight - BtnGap - statusW : RightEdge);
+      float titleRoom = titleRight - TitleLeft;
       DrawTextCentered(g, Fit(g, title, fontBig, titleRoom), fontBig, BrText, TitleLeft, axis);
 
       if (action != null)
@@ -274,10 +284,19 @@ namespace Milkman
           DrawText(g, "—", fontTick, BrSub, x, metaY);
           continue;
         }
-        string left, right;
-        BandTexts(window, out left, out right);
-        DrawText(g, left, fontTick, BrText, x, metaY);
-        DrawRight(g, right, fontTick, BrSub, x + w, metaY);
+        string label, pct, right;
+        BandTexts(window, out label, out pct, out right);
+        // 标签可能比「5h」长得多（例如代码审查窗口），右侧还有剩余时间。
+        // 百分比优先保住：先按剩余宽度缩短标签，实在放不下就只显示百分比。
+        float rightW = string.IsNullOrEmpty(right) ? 0 : Wd(g, right, fontTick);
+        float pctW = Wd(g, pct, fontTick);
+        float gapW = Wd(g, " ", fontTick);
+        float labelMax = w - rightW - (rightW > 0 ? MetaGap : 0) - pctW - gapW;
+        // 只要标签没被截成纯省略号就带上；连一个字都留不下才只显示百分比
+        string shortLabel = labelMax > 0 ? Fit(g, label, fontTick, labelMax) : "…";
+        string text = shortLabel.Length > 0 && shortLabel != "…" ? shortLabel + " " + pct : pct;
+        DrawText(g, Fit(g, text, fontTick, w - rightW - (rightW > 0 ? MetaGap : 0)), fontTick, BrText, x, metaY);
+        if (rightW > 0) DrawRight(g, right, fontTick, BrSub, x + w, metaY);
       }
     }
 
@@ -328,6 +347,7 @@ namespace Milkman
     {
       long ms = (long)(resetMs - Program.NowUnixMs());
       if (ms <= 0) return "已重置";
+      if (ms > 365L * 24 * 3600 * 1000) return "—"; // 异常大的重置时间：不能让绘制线程抛 OverflowException
       var t = TimeSpan.FromMilliseconds(ms);
       if (t.TotalDays >= 1) return (int)t.TotalDays + "d" + t.Hours + "h";
       return (int)t.TotalHours + "h" + t.Minutes.ToString("00") + "m";

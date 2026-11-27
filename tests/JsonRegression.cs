@@ -60,10 +60,13 @@ static class JsonRegression
 
             System.IO.File.WriteAllText(path,oldAuth);
             Func<string,string> concurrentWrite=rt => { System.IO.File.WriteAllText(path,cliAuth); return rotated; };
-            bool rejected=false;
-            try { core.Invoke(new DataFetcher(),new object[]{new FetchResult(),path,afterRefresh,concurrentWrite}); }
-            catch (TargetInvocationException e) { rejected=e.InnerException.Message.Contains("凭据已变更"); }
-            Check(rejected && System.IO.File.ReadAllText(path)==cliAuth,"refresh does not overwrite an observed concurrent credential update");
+            // 刷新期间凭据被别的进程改写：不覆盖对方（可能刚轮换出有效 RT），
+            // 但要用本次拿到的 access_token 把请求完成，而不是让用户看到错误。
+            bool completed=false;
+            try { core.Invoke(new DataFetcher(),new object[]{new FetchResult(),path,afterRefresh,concurrentWrite}); completed=true; }
+            catch (TargetInvocationException) { completed=false; }
+            Check(completed,"concurrent credential update still completes the request");
+            Check(System.IO.File.ReadAllText(path)==cliAuth,"refresh does not overwrite an observed concurrent credential update");
             Check(System.IO.Directory.GetFileSystemEntries(dir).Length==1,"refresh leaves no temporary credential file");
         } finally { System.IO.Directory.Delete(dir,true); }
     }

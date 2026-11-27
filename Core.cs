@@ -177,7 +177,11 @@ namespace Milkman
         string dir = Path.GetDirectoryName(path);
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
         // 配置文件是给人读和手改的，用缩进格式；凭据文件仍用紧凑格式。
-        File.WriteAllText(path, Json.SerializeIndented(ToDictionary()), new UTF8Encoding(false));
+        // 先写临时文件再替换，避免写盘中途失败把配置截断成半截 JSON。
+        string temp = path + ".tmp";
+        File.WriteAllText(temp, Json.SerializeIndented(ToDictionary()), new UTF8Encoding(false));
+        if (File.Exists(path)) File.Replace(temp, path, null);
+        else File.Move(temp, path);
         return true;
       }
       catch { return false; }
@@ -190,9 +194,13 @@ namespace Milkman
       object value;
       if (d.TryGetValue("Monitor", out value) && value != null)
         cfg.Monitor = Convert.ToString(value, CultureInfo.InvariantCulture);
-      if (d.TryGetValue("OffsetX", out value) && value != null) cfg.OffsetX = Convert.ToInt32(value, CultureInfo.InvariantCulture);
-      if (d.TryGetValue("OffsetY", out value) && value != null) cfg.OffsetY = Convert.ToInt32(value, CultureInfo.InvariantCulture);
-      if (d.TryGetValue("Docked", out value) && value != null) cfg.Docked = Convert.ToBoolean(value, CultureInfo.InvariantCulture);
+      // 手改配置时单个字段写错不该让整份配置作废：各自兜住转换异常，保留该字段默认值
+      try { if (d.TryGetValue("OffsetX", out value) && value != null) cfg.OffsetX = Convert.ToInt32(value, CultureInfo.InvariantCulture); }
+      catch (Exception) { }
+      try { if (d.TryGetValue("OffsetY", out value) && value != null) cfg.OffsetY = Convert.ToInt32(value, CultureInfo.InvariantCulture); }
+      catch (Exception) { }
+      try { if (d.TryGetValue("Docked", out value) && value != null) cfg.Docked = Convert.ToBoolean(value, CultureInfo.InvariantCulture); }
+      catch (Exception) { }
       if (d.TryGetValue("RefreshSeconds", out value) && value != null)
       {
         try { cfg.RefreshSeconds = Convert.ToInt32(value, CultureInfo.InvariantCulture); }
@@ -394,7 +402,11 @@ namespace Milkman
           file.Write(bytes, 0, bytes.Length);
           file.Flush(true);
         }
-        CheckAuthUnchanged(authPath, current);
+        // 写完临时文件后再确认一次：若磁盘在刷新期间被别的进程改过，说明另一次刷新
+        // 已经拿走了最新的 refresh_token。此时**不覆盖**对方的写入（覆盖可能冲掉它刚
+        // 轮换出的有效 RT），直接用本次拿到的 access_token 完成请求即可；
+        // 直接失败会让用户在一次可用的会话里看到错误。
+        if (!AuthUnchanged(authPath, current)) return refreshed.Access;
         // WSL 不支持 ReplaceFileW；同目录 Rename Overwrite 不允许退化成复制。
         if (wsl)
         {
@@ -410,10 +422,15 @@ namespace Milkman
       }
     }
 
+    static bool AuthUnchanged(string path, string expected)
+    {
+      try { return string.Equals(File.ReadAllText(path, Encoding.UTF8), expected, StringComparison.Ordinal); }
+      catch { return false; }
+    }
+
     static void CheckAuthUnchanged(string path, string expected)
     {
-      if (!string.Equals(File.ReadAllText(path, Encoding.UTF8), expected, StringComparison.Ordinal))
-        throw new IOException("Codex 凭据已变更，请重试");
+      if (!AuthUnchanged(path, expected)) throw new IOException("Codex 凭据已变更，请重试");
     }
 
     static void PrepareAuthFile(string path, bool wsl)
@@ -520,9 +537,18 @@ namespace Milkman
       }
       // code_review_rate_limit 是独立周限，可选展示
       var crl = Map(d, "code_review_rate_limit");
-      if (crl != null) AddWindowFromDict(result, Map(crl, "primary_window") ?? crl, "代码审查");
+      if (crl != null) AddWindowFromDict(result, Map(crl, "primary_window") ?? crl, "审查");
       if (result.Windows.Count == 0) throw new Exception("wham/usage 响应无用量窗口");
       EnsureFiveHourWindow(result.Windows);
+      // 版式最多三段；5h 占位 + 周 + 月 + 审查会超出一段，这里明确裁掉「审查」，
+      // 而不是让绘制层静默丢弃最后一个窗口。
+      while (result.Windows.Count > 3)
+      {
+        int index = -1;
+        for (int i = 0; i < result.Windows.Count; i++)
+          if (result.Windows[i].Label == "审查") { index = i; break; }
+        result.Windows.RemoveAt(index >= 0 ? index : result.Windows.Count - 1);
+      }
     }
 
     // 服务端临时不返回 5h 时仍保留版位；字段恢复后自动换回真实数据。
@@ -560,15 +586,15 @@ namespace Milkman
         else if (sec == 604800) label = "周";
         else if (sec >= 86400 && sec % 86400 == 0) label = sec / 86400 + "d";
         else if (sec >= 3600 && sec % 3600 == 0) label = sec / 3600 + "h";
-        else label = (sec / 3600.0).ToString("F1") + "h";
+        else label = (sec / 3600.0).ToString("F1", CultureInfo.InvariantCulture) + "h";
       }
       win.Label = label;
       win.UsedPct = Convert.ToDouble(used, CultureInfo.InvariantCulture) / 100.0;
       double resetMs = 0;
       object reset = Value(w, "reset_at") ?? Value(w, "resets_at_time");
       object after = Value(w, "reset_after_seconds");
-      if (reset != null) resetMs = Convert.ToDouble(reset) * 1000;
-      else if (after != null) resetMs = Program.NowUnixMs() + Convert.ToDouble(after) * 1000;
+      if (reset != null) resetMs = Convert.ToDouble(reset, CultureInfo.InvariantCulture) * 1000;
+      else if (after != null) resetMs = Program.NowUnixMs() + Convert.ToDouble(after, CultureInfo.InvariantCulture) * 1000;
       win.ResetMs = resetMs;
       result.Windows.Add(win);
     }
@@ -623,7 +649,7 @@ namespace Milkman
       if (w == null) return null;
       object percent = Value(w, "percent");
       if (percent == null) throw new Exception("Go " + key + " 无 percent");
-      var g = new UsageWindow { Label = label, UsedPct = Convert.ToDouble(percent) / 100.0, ResetMs = 0 };
+      var g = new UsageWindow { Label = label, UsedPct = Convert.ToDouble(percent, CultureInfo.InvariantCulture) / 100.0, ResetMs = 0 };
       string resetsAt = Text(w, "resetsAt");
       DateTimeOffset t;
       if (DateTimeOffset.TryParse(resetsAt, out t))
@@ -800,7 +826,8 @@ namespace Milkman
       req.Method = method;
       req.Accept = "application/json";
       req.UserAgent = BrowserUA;
-      req.Timeout = 15000;
+      req.Timeout = 15000;          // 连接/首字节
+      req.ReadWriteTimeout = 15000; // 单次读写：默认 5 分钟且每次读都重置，滴字节会把 Busy 卡死
       if (bearer != null) req.Headers["Authorization"] = "Bearer " + bearer;
       return req;
     }
@@ -836,8 +863,27 @@ namespace Milkman
       using (var reader = new StreamReader(stream))
       {
         status = (int)response.StatusCode;
-        return reader.ReadToEnd();
+        return ReadBounded(reader, MaxBodyBytes);
       }
+    }
+
+    // 响应体上限：超出即中断，避免先吃满内存再被 JSON 层的上限拒绝
+    const int MaxBodyBytes = 2 * 1024 * 1024;
+
+    static string ReadBounded(StreamReader reader, int maxBytes)
+    {
+      var buffer = new char[8192];
+      var text = new System.Text.StringBuilder();
+      int total = 0;
+      while (true)
+      {
+        int read = reader.Read(buffer, 0, buffer.Length);
+        if (read <= 0) break;
+        total += read;
+        if (total > maxBytes) throw new Exception("响应过大（超过 2MB）");
+        text.Append(buffer, 0, read);
+      }
+      return text.ToString();
     }
   }
 

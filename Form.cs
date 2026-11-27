@@ -208,9 +208,11 @@ namespace Milkman
       {
         // 吸附状态已在 RestoreLocation 里按目标屏是否可吸附判定过，这里沿用
         if (docked) { expanded = false; pinned = false; }
-        // 句柄就绪后按最终所在屏重算尺寸与位置（吸附态贴屏幕顶边）
+        // 句柄就绪后按最终所在屏重算尺寸与位置（吸附态贴屏幕顶边）。
+        // 锚点取窗口当前位置相对目标屏的偏移：RestoreLocation 已经处理过「配置未设置偏移」
+        // 时靠右下角摆放的情况，若这里再用 Math.Max(0, -1) 会把窗口拽到左上角。
         ApplyLayout(Screen.FromControl(this),
-          new Point(Math.Max(0, _cfg.OffsetX), Math.Max(0, _cfg.OffsetY)));
+          new Point(Math.Max(0, Left - monRect.Left), Math.Max(0, Top - monRect.Top)));
         if (docked) _dockTimer.Start();
       };
       // 插拔屏幕、改分辨率或缩放的统一入口：重新解析所在屏并按锚点归位
@@ -243,6 +245,35 @@ namespace Milkman
       if (!docked || expanded || Top > CollapsedTop) Invalidate();
     }
 
+    // 窗口是否处于用户能看见的状态：未吸附、已展开、或钉住不动
+    bool VisibleToUser() { return !docked || expanded || pinned; }
+
+    // 收起时窗口只有 5px 提示条，继续按周期取数只是白耗网络与电量；
+    // 展开或钉住时才让自动刷新计时器工作。
+    void SyncRefreshTimer()
+    {
+      _refreshTimer.Enabled = VisibleToUser() && _refresh.Rows.Exists(r => r.Auto);
+    }
+
+    // 长时间收起后再打开：数据可能已过期，或者进程重启后还没有任何数据。
+    // 这里补一次取数，保证用户展开就能看到内容，而不是一片空条还等着点按钮。
+    void RefreshWhenOpened()
+    {
+      if (_refresh.Rows.Count == 0) return;
+      if (!_refresh.Started) { _refresh.Click(_refresh.Rows[0]); return; } // 等同点一次「获取用量」
+
+      long maxAge = Math.Max(_cfg.RefreshSeconds * 2L, 120L); // 秒
+      DateTime now = DateTime.Now;
+      foreach (var row in _refresh.Rows)
+      {
+        if (row.Busy) continue;
+        bool stale = row.Result.Error != null
+          || row.Result.LastSuccess == default(DateTime)
+          || (now - row.Result.LastSuccess).TotalSeconds > maxAge;
+        if (stale && row.TryStart(true)) DispatchRefresh(row);
+      }
+    }
+
     static void EnableNetwork()
     {
       try { ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12; } catch { }
@@ -255,7 +286,7 @@ namespace Milkman
         var result = row.Fetch();
         try { BeginInvoke((Action)(() => {
           row.Apply(result);
-          _refreshTimer.Enabled = _refresh.Rows.Exists(r => r.Auto);
+          SyncRefreshTimer();
           _clockTimer.Enabled = _refresh.HasCountdown(Program.NowUnixMs());
           RepaintUsage();
         })); }
@@ -338,9 +369,15 @@ namespace Milkman
           expanded = true;
           _dockTimer.Start();
         }
-        // 尺寸随拖动已由 WM_DPICHANGED 按目标屏设好；这里只在吸附态归位到屏幕顶边
+        // 尺寸随拖动已由 WM_DPICHANGED 按目标屏设好；吸附态归位到屏幕顶边。
+        // 钉住时不能收起：DockTick 在 pinned 下直接返回，收下去就再也没人展开了。
         monRect = target.Bounds;
-        if (docked) Location = new Point(Left, CollapsedTop);
+        if (docked)
+        {
+          if (pinned) { expanded = true; Location = new Point(Left, monRect.Top); }
+          else Location = new Point(Left, CollapsedTop);
+        }
+        SyncRefreshTimer(); // 脱离吸附后窗口重新可见，刷新计时器要恢复
         SaveState();
         base.WndProc(ref m);
         return;
@@ -370,6 +407,7 @@ namespace Milkman
           }
           else
             _dockTimer.Start();
+          SyncRefreshTimer();
           Invalidate();
         }
         m.Result = IntPtr.Zero;
@@ -508,8 +546,14 @@ namespace Milkman
     void OnDisplayChanged(object sender, EventArgs e)
     {
       if (IsDisposed || !IsHandleCreated) return;
-      ApplyLayout(FindScreen(_cfg.Monitor) ?? Screen.FromControl(this),
-        new Point(Math.Max(0, _cfg.OffsetX), Math.Max(0, _cfg.OffsetY)));
+      Screen screen = FindScreen(_cfg.Monitor) ?? Screen.FromControl(this);
+      // 显示器排列变化后吸附资格可能变了（例如另一块屏被挪到上方），要重新判定，
+      // 否则收起的提示条会压到相邻屏幕上。钉住的窗口保持展开。
+      bool canDock = _cfg.Docked && DockableOn(screen.Bounds);
+      if (docked && !canDock) { docked = false; pinned = false; _dockTimer.Stop(); }
+      ApplyLayout(screen, new Point(Math.Max(0, Left - screen.Bounds.Left), Math.Max(0, Top - screen.Bounds.Top)));
+      if (docked && pinned) Location = new Point(Location.X, screen.Bounds.Top);
+      SyncRefreshTimer();
       Invalidate();
     }
 
@@ -540,12 +584,15 @@ namespace Milkman
         if (!expanded && !ForegroundFullscreen())
         {
           expanded = true;
-          Invalidate(); // 展开瞬间立即按最新数据重绘
+          RefreshWhenOpened(); // 收起期间不取数，展开时补齐
+          SyncRefreshTimer();
+          Invalidate();        // 展开瞬间立即按最新数据重绘
         }
       }
       else if (expanded)
       {
         expanded = false; // 检测到离开即开始收起，无额外等待
+        SyncRefreshTimer(); // 收起后停止后台轮询
       }
       int target = expanded ? monRect.Top : CollapsedTop;
       if (wr.Top != target)

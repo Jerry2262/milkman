@@ -8,7 +8,7 @@ Windows 专用的 WinForms 常驻浮窗：无边框、半透明、屏幕顶部�
 
 ## 功能
 
-- **ChatGPT Plus**：按服务端返回的窗口（5h / 周 / 代码审查）分段展示；成功响应有其他额度窗口但暂时缺少 5h 时显示 `5h ∞`
+- **ChatGPT Plus**：按服务端返回的窗口（5h / 周 / 审查）分段展示；成功响应有其他额度窗口但暂时缺少 5h 时显示 `5h ∞`
 - **OpenCode Go**：支持多个账户；每个账户 5h / 周 / 月三条用量，账户级计数与其他设备一致
 - **Command Code（GOAT 等套餐）**：5h / 周两个滚动窗口加月度 credits；配置里没有这一段时整块隐藏
 - 屏幕顶部吸附 + 缓出动画 + 双击 Pin
@@ -53,35 +53,38 @@ build.bat
 
 ```json
 {
-  "X": 2224,
-  "Y": -2160,
-  "Docked": true,
-  "RefreshSeconds": 60,
-  "ChatGptAuthPath": "",
   "OpenCodeAccounts": [
     { "Name": "个人", "Key": "oc_sk_...", "AuthPath": "" }
   ],
-  "CommandCode": { "Name": "主账号", "Key": "user_..." }
+  "CommandCode": { "Name": "主账号", "Key": "user_..." },
+  "ChatGptAuthPath": "",
+  "RefreshSeconds": 60,
+  "Docked": true,
+  "Monitor": "\\\\.\\DISPLAY2",
+  "OffsetX": 777,
+  "OffsetY": 222
 }
 ```
 
 - `RefreshSeconds`：刷新间隔，默认 60 秒；非正值或无法换算为计时器毫秒值的间隔回落到默认值
 - `ChatGptAuthPath`：ChatGPT/Codex 的 `auth.json` 路径；留空用 `%USERPROFILE%\.codex\auth.json`，填了只认填的那一份（可以指向 WSL 的路径，例如 `\\wsl.localhost\<发行版>\home\<用户>\.codex\auth.json`）
-- `OpenCodeAccounts`：账户列表，每项在浮窗中占一行；留空数组 `[]` 会隐藏 OpenCode Go 区块
+- `OpenCodeAccounts`：账户列表，每个账户在浮窗中是一个三行区块；留空数组 `[]` 会隐藏 OpenCode Go 区块
 - `Name`：显示名称
 - `Key`：OpenCode Go 的 API key（Console → Account › Personal API keys，`oc_sk_` 开头）。OpenCode 2 把凭据存进本地数据库、不再更新 `auth.json`，所以推荐直接填这里
 - `AuthPath`：OpenCode 1 的 `auth.json` 路径；`Key` 为空时从中读取 `opencode-go.key`
 - `CommandCode`：Command Code 订阅（GOAT / Pro 等）；整段删掉或写成 `null` 会隐藏该区块
 - `CommandCode.Key`：Studio → API keys 创建的 key（`user_` 开头），CLI 与 Provider API 同一把；`Name` 只是显示名
-- `X` / `Y` / `Docked`：窗口位置与吸附状态，由程序自动维护
+- `Monitor` / `OffsetX` / `OffsetY`：窗口所在显示器（设备名）和相对该屏左上角的偏移，由程序自动维护；换分辨率或缩放后仍然有效。`Monitor` 为空或显示器已不存在时回到主屏
+- `Docked`：是否吸附收起，由程序自动维护
 
 `config.json` 必须是标准 JSON：程序只接受标准语法，单引号、无引号键之类的宽松写法会被拒绝。解析失败时程序回落到默认配置，并把原文件备份为 `config.json.bad`，避免原配置被静默覆盖。
 
-首次运行且没有配置账户时，程序会探测本机 OpenCode 1 的 `%LOCALAPPDATA%\opencode\auth.json` 和 `~/.local/share/opencode/auth.json`；找不到就隐藏 Go 区块，填好配置后自动显示。
+配置里**完全没有** `OpenCodeAccounts` 字段时（例如首次运行），程序会探测本机 OpenCode 1 的 `%LOCALAPPDATA%\opencode\auth.json` 和 `~/.local/share/opencode/auth.json`；写成空数组 `[]` 则不探测、直接隐藏 Go 区块。
 
 ## 使用
 
-- 每次启动后，代理就绪时点一次「获取用量」，同时加载 ChatGPT、所有已配置的 Go 账户和 Command Code；成功的来源定时刷新，失败的来源点本行「重试」
+- 每次启动后点一次「获取用量」（或直接悬浮展开吸附的窗口），同时加载 ChatGPT、所有已配置的 Go 账户和 Command Code；成功的来源定时刷新，失败的来源点本行「重试」
+- 收起成提示条期间不轮询、不取数；重新展开时若数据缺失或已过期会立刻补取一次，所以放很久再打开也不会是空的
 - 鼠标移到屏幕顶部提示条上展开，移开自动收起
 - 拖到屏幕顶吸附；往下拖离取消吸附
 - 吸附状态下双击切换「钉住」，钉住后不自动收起
@@ -98,7 +101,7 @@ build.bat
 
 ## 启动开销与回归检查
 
-JSON 读写使用 [Core.cs](<Core.cs>) 中的轻量值树实现，不加载 ASP.NET 序列化组件。配置已明确账户列表时不再探测默认认证路径；自启注册表值未变化时不重复写入。点击「获取用量」之前，不初始化网络 TLS、不发用量请求、不启动定时刷新或倒计时重绘。吸附静止时每 100 ms 检查一次鼠标位置，滑动动画保持 30 ms 步进。
+JSON 读写使用 [Core.cs](<Core.cs>) 中的轻量值树实现，不加载 ASP.NET 序列化组件。配置已明确账户列表时不再探测默认认证路径；自启注册表值未变化时不重复写入。首次取数（点「获取用量」，或吸附状态下第一次展开）之前，不初始化网络 TLS、不发用量请求、不启动定时刷新或倒计时重绘。吸附静止时每 100 ms 检查一次鼠标位置，滑动动画保持 30 ms 步进。收起成 5 px 提示条期间定时刷新停表，不会在没人看的时候持续联网。
 
 在 Windows 中运行：
 
@@ -108,11 +111,19 @@ tests\run.bat
 
 [JsonRegression.cs](<tests/JsonRegression.cs>) 使用合成数据检查配置兼容性（含空值回落、账户 null 过滤）、授权 JSON 未知字段与数字精度、非法输入、并发读写、`last_refresh` 的 RFC3339 时间戳格式、各来源的首次取数与失败重试状态、版式对齐规则，以及与原序列化器的差分结果；不读取真实认证文件、不请求 API。测试程序才会引用旧序列化组件作为对照，正式程序不依赖它。
 
-界面改动可以先用 [StateShots.cs](<tests/StateShots.cs>) 离屏渲染各个状态（启动、获取中、成功、失败、部分失败）再上桌面确认，它不显示窗口、不请求网络：
+界面改动可以先用 [StateShots.cs](<tests/StateShots.cs>) 离屏渲染各个状态再上桌面确认，它不显示窗口、不请求网络。除了启动、获取中、成功、失败、部分失败，还覆盖了段数 1/3、超长账户名、超长错误原因、满额与无穷占位这些边界：
 
 ```bat
-csc /nologo /codepage:65001 /target:exe /main:StateShots /r:System.dll /r:System.Core.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll /out:%TEMP%\StateShots.exe Layout.cs Core.cs Ui.cs Form.cs tests\StateShots.cs
+"%WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe" /nologo /codepage:65001 /target:exe /main:StateShots /r:System.dll /r:System.Core.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll /out:%TEMP%\StateShots.exe Layout.cs Core.cs Ui.cs Form.cs tests\StateShots.cs
 %TEMP%\StateShots.exe %TEMP%\milkman-states
+```
+
+（`csc.exe` 不在 PATH 里，要用上面那个全路径；输出目录不存在时程序会自己创建。）
+
+想看真实运行效果时用场景验收脚本：它会真正启动浮窗，按常见用法驱动（首次启动、等待点击、获取中、成功、失败、吸附收起与展开），逐个截图。数据目录通过 `MILKMAN_DATA_DIR` 指向临时目录，不碰真实配置；自启项会先备份再还原。
+
+```bat
+powershell -NoProfile -ExecutionPolicy Bypass -File tests\scenarios.ps1 -OutDir %TEMP%\milkman-scn
 ```
 
 ## 已知限制
