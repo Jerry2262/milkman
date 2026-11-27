@@ -1282,11 +1282,9 @@ namespace Milkman
       if (!docked || dragging || pinned) return; // pinned 时冻结自动收放
       Point mp = Cursor.Position;
       Rectangle wr = new Rectangle(Location, Size);
-      bool nearTop = mp.X >= wr.Left - 80 && mp.X <= wr.Right + 80
-                  && mp.Y >= monRect.Top - 4 && mp.Y <= monRect.Top + 6;
-      bool inside = mp.X >= wr.Left - 20 && mp.X <= wr.Right + 20
-                 && mp.Y >= wr.Top - 20 && mp.Y <= wr.Bottom + 20;
-      if (nearTop || inside)
+      // 只认窗口自身的可见范围(收起时就是顶部 5px 提示条), 不外扩任何感应区
+      bool inside = Rectangle.Intersect(wr, monRect).Contains(mp);
+      if (inside)
       {
         if (!expanded && !ForegroundFullscreen())
         {
