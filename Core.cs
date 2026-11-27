@@ -547,14 +547,14 @@ namespace Milkman
       object used = Value(w, "used_percent");
       if (used == null) return;
       var win = new UsageWindow();
-      // 无显式 label 时按窗口秒数生成（18000→5h, 604800 或其他周四→周, 其余按天/小时）
+      // 无显式 label 时按窗口秒数生成（18000→5h, 604800→周, 整日→Nd, 整小时→Nh）
       if (label == null)
       {
         object seconds = Value(w, "limit_window_seconds");
         long sec = seconds != null ? Convert.ToInt64(seconds) : 0;
         if (sec == 18000) label = "5h";
         else if (sec == 604800) label = "周";
-        else if (sec >= 86400 && sec % 86400 == 0) label = sec / 86400 + "天";
+        else if (sec >= 86400 && sec % 86400 == 0) label = sec / 86400 + "d";
         else if (sec >= 3600 && sec % 3600 == 0) label = sec / 3600 + "h";
         else label = (sec / 3600.0).ToString("F1") + "h";
       }

@@ -322,12 +322,14 @@ namespace Milkman
       return BrRed;
     }
 
+    // 剩余时间统一用 d/h/m，不混中文「天」：注脚宽度紧张，拉丁字符更窄，
+    // 且同一条文案里中英混排会显得不齐。
     static string FormatRemaining(double resetMs)
     {
       long ms = (long)(resetMs - Program.NowUnixMs());
       if (ms <= 0) return "已重置";
       var t = TimeSpan.FromMilliseconds(ms);
-      if (t.TotalDays >= 1) return (int)t.TotalDays + "天" + t.Hours + "h";
+      if (t.TotalDays >= 1) return (int)t.TotalDays + "d" + t.Hours + "h";
       return (int)t.TotalHours + "h" + t.Minutes.ToString("00") + "m";
     }
   }

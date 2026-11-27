@@ -235,10 +235,39 @@ static class JsonRegression
         }
     }
 
+    // 时间文案统一用 d/h/m，不混中文「天」；窗口标签同理。
+    static void CheckTimeFormat() {
+        var fmt = typeof(MilkmanForm).GetMethod("FormatRemaining", BindingFlags.NonPublic|BindingFlags.Static);
+        long now = Program.NowUnixMs();
+        long h = 3600L*1000, d = 24*h;
+
+        // 加缓冲：FormatRemaining 内部会重新取当前时间，紧贴边界会导致结果抖动
+        string overDay  = (string)fmt.Invoke(null,new object[]{(double)(now + 24*d + 23*h + 30*60*1000)});
+        string underDay = (string)fmt.Invoke(null,new object[]{(double)(now + 5*h + 30*60*1000 + 30*1000)});
+        string expired  = (string)fmt.Invoke(null,new object[]{(double)(now - 1000)});
+
+        Check(overDay=="24d23h","remaining time above one day uses d and h: "+overDay);
+        Check(underDay=="5h30m","remaining time under one day uses h and m: "+underDay);
+        Check(expired=="已重置","expired window reports reset state");
+        Check(overDay.IndexOf("天",StringComparison.Ordinal)<0 && underDay.IndexOf("天",StringComparison.Ordinal)<0,
+            "time text never mixes the Chinese day unit");
+
+        // ChatGPT 窗口标签：整日窗口应生成 Nd
+        var parse=typeof(DataFetcher).GetMethod("ParseWham", BindingFlags.NonPublic|BindingFlags.Instance);
+        var r=new FetchResult();
+        parse.Invoke(new DataFetcher(), new object[]{r,
+            "{\"rate_limit\":{\"primary_window\":{\"limit_window_seconds\":2592000,\"used_percent\":10,\"reset_at\":1900000000}}}"});
+        // 缺少 5h 时会插入一个 5h 占位，因此 30d 窗口排在它之后
+        bool has30d=false;
+        foreach (var win in r.Windows) if (win.Label=="30d") has30d=true;
+        Check(has30d,"whole-day window label uses d: "+r.Windows[0].Label);
+    }
+
     static void Main() {
         CheckRefreshRows();
         CheckPlacement();
         CheckLayout();
+        CheckTimeFormat();
         CheckConfigEncoding();
         System.Threading.Thread.CurrentThread.CurrentCulture = new CultureInfo("fr-FR");
         foreach (var json in new[] {
