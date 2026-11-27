@@ -106,27 +106,27 @@ static class JsonRegression
         var tiny      = new System.Drawing.Rectangle(0,0,800,600);
 
         // 单屏：偏移就是相对主屏的位置
-        Check(MilkmanForm.AnchorTo(primary,new System.Drawing.Point(100,200),size,false)==new System.Drawing.Point(100,200),
+        Check(ScreenLayout.AnchorTo(primary,new System.Drawing.Point(100,200),size,false)==new System.Drawing.Point(100,200),
             "single screen keeps the anchor offset");
 
         // 副屏在顶部(负坐标)：同一锚点语义不变
-        Check(MilkmanForm.AnchorTo(upper,new System.Drawing.Point(300,140),size,false)==new System.Drawing.Point(300,-1300),
+        Check(ScreenLayout.AnchorTo(upper,new System.Drawing.Point(300,140),size,false)==new System.Drawing.Point(300,-1300),
             "upper screen resolves negative coordinates from its own origin");
 
         // 副屏在左侧：坐标系原点不同，偏移语义一致
-        Check(MilkmanForm.AnchorTo(left,new System.Drawing.Point(120,150),size,false)==new System.Drawing.Point(-1800,150),
+        Check(ScreenLayout.AnchorTo(left,new System.Drawing.Point(120,150),size,false)==new System.Drawing.Point(-1800,150),
             "left screen keeps the same relative offset");
 
         // 分辨率变小：偏移超出可见范围时被夹回工作区
-        Check(MilkmanForm.AnchorTo(tiny,new System.Drawing.Point(1700,1000),size,false)==new System.Drawing.Point(280,356),
+        Check(ScreenLayout.AnchorTo(tiny,new System.Drawing.Point(1700,1000),size,false)==new System.Drawing.Point(280,356),
             "offset beyond a shrunken screen is clamped into view");
 
         // 吸附态：纵向贴屏幕顶边，横向超出时仍被夹回可见范围
-        Check(MilkmanForm.AnchorTo(upper,new System.Drawing.Point(2400,900),size,true)==new System.Drawing.Point(2040,-1440),
+        Check(ScreenLayout.AnchorTo(upper,new System.Drawing.Point(2400,900),size,true)==new System.Drawing.Point(2040,-1440),
             "docked placement pins to the screen top edge");
 
         // 窗口比工作区还宽时不产生负坐标
-        Check(MilkmanForm.AnchorTo(new System.Drawing.Rectangle(0,0,400,400),new System.Drawing.Point(0,0),size,false).X==0,
+        Check(ScreenLayout.AnchorTo(new System.Drawing.Rectangle(0,0,400,400),new System.Drawing.Point(0,0),size,false).X==0,
             "screen narrower than the window stays at the left edge");
 
         // 屏消失：按名字找不到返回 null，调用方回落主屏
@@ -141,21 +141,21 @@ static class JsonRegression
         var alone  = new System.Drawing.Rectangle(0,0,1920,1200);
 
         // 用户当前的布局：副屏在主屏正上方，因此主屏不能吸附，副屏可以
-        Check(!MilkmanForm.CanDock(bottom,new[]{top,bottom}),"main screen cannot dock when another screen sits directly above");
-        Check(MilkmanForm.CanDock(top,new[]{top,bottom}),"upper screen can dock because nothing is above it");
+        Check(!ScreenLayout.CanDock(bottom,new[]{top,bottom}),"main screen cannot dock when another screen sits directly above");
+        Check(ScreenLayout.CanDock(top,new[]{top,bottom}),"upper screen can dock because nothing is above it");
 
         // 只有一块屏时总是可以吸附
-        Check(MilkmanForm.CanDock(alone,new[]{alone}),"single screen can always dock");
+        Check(ScreenLayout.CanDock(alone,new[]{alone}),"single screen can always dock");
 
         // 上方有屏但横向不重叠，互不影响
         var farAbove = new System.Drawing.Rectangle(3000,-1440,1280,800);
-        Check(MilkmanForm.CanDock(alone,new[]{alone,farAbove}),"a screen above but horizontally apart does not block docking");
+        Check(ScreenLayout.CanDock(alone,new[]{alone,farAbove}),"a screen above but horizontally apart does not block docking");
 
         // 右侧屏也在副屏覆盖范围内
-        Check(!MilkmanForm.CanDock(side,new[]{top,bottom,side}),"screen spanned by an upper display cannot dock");
+        Check(!ScreenLayout.CanDock(side,new[]{top,bottom,side}),"screen spanned by an upper display cannot dock");
 
         // 位于下方的那块屏不会阻止上方屏吸附
-        Check(MilkmanForm.CanDock(top,new[]{top,bottom,side}),"lower screens never block docking above them");
+        Check(ScreenLayout.CanDock(top,new[]{top,bottom,side}),"lower screens never block docking above them");
     }
 
     // 配置文件编码：必须是无 BOM 的 UTF-8，且非 ASCII（中文账户名）往返后不变。
@@ -184,6 +184,16 @@ static class JsonRegression
             var loaded=Config.Parse(text);
             Check(loaded.OpenCodeAccounts.Count==1 && loaded.OpenCodeAccounts[0].Name=="个人","config round-trips a Chinese account name");
             Check(loaded.Monitor==@"\\.\DISPLAY2" && loaded.OffsetX==1182 && loaded.OffsetY==855,"config round-trips the placement anchor");
+
+            // 配置文件要给人读：必须是多行缩进格式，且账户字段排在程序维护的窗口状态之前
+            Check(text.Contains("\n"),"config is written across multiple lines for human editing");
+            Check(text.Contains("\n  \"OpenCodeAccounts\""),"config indents top-level keys");
+            Check(text.IndexOf("\"OpenCodeAccounts\"") < text.IndexOf("\"Monitor\""),"human-edited fields come before machine-maintained layout state");
+
+            // 凭据文件仍须紧凑：同一份 JSON 的紧凑序列化不含换行
+            string compact=Write(new Dictionary<string,object>{{"a",1},{"b","x"}});
+            Check(!compact.Contains("\n"),"credential files stay compact");
+            Check(compact=="{\"a\":1,\"b\":\"x\"}","compact form keeps the single-line shape");
         } finally { if (System.IO.Directory.Exists(dir)) System.IO.Directory.Delete(dir,true); }
     }
 
@@ -196,9 +206,39 @@ static class JsonRegression
         return -1;
     }
 
+    // 版式对齐：三行左端必须落在同一条线上；各段数下末段必须收到右边界。
+    // 段数 1/2/3 对应注脚 2/4/6 块（每段左右各一块文字）。
+    static void CheckLayout() {
+        const int left = 20, right = 500, gap = 8;
+
+        // 段数 1、2、3 都要满足：首段左端 == 左对齐线，末段右端 == 右边界
+        foreach (int count in new[] { 1, 2, 3 }) {
+            float firstX, firstW;
+            MilkmanForm.SegmentIn(left,right,gap,0,count,out firstX,out firstW);
+            Check(Math.Abs(firstX-left)<0.001,"first segment starts on the left alignment line (count="+count+")");
+
+            float lastX, lastW;
+            MilkmanForm.SegmentIn(left,right,gap,count-1,count,out lastX,out lastW);
+            Check(Math.Abs((lastX+lastW)-right)<0.001,"last segment ends on the right edge (count="+count+")");
+
+            // 相邻段间距恒定，段宽一致
+            for (int i=0;i<count;i++) {
+                float x,w;
+                MilkmanForm.SegmentIn(left,right,gap,i,count,out x,out w);
+                Check(Math.Abs(w-firstW)<0.001,"all segments share one width (count="+count+")");
+                if (i>0) {
+                    float px,pw;
+                    MilkmanForm.SegmentIn(left,right,gap,i-1,count,out px,out pw);
+                    Check(Math.Abs((x-(px+pw))-gap)<0.001,"segment gap is constant (count="+count+")");
+                }
+            }
+        }
+    }
+
     static void Main() {
         CheckRefreshRows();
         CheckPlacement();
+        CheckLayout();
         CheckConfigEncoding();
         System.Threading.Thread.CurrentThread.CurrentCulture = new CultureInfo("fr-FR");
         foreach (var json in new[] {

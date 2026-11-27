@@ -4,7 +4,7 @@
 
 ![界面预览](docs/screenshot.png)
 
-Windows 专用的单文件 WinForms 常驻浮窗：无边框、半透明、屏幕顶部吸附，鼠标靠近展开，双击钉住。整个程序只有一个 [Main.cs](Main.cs)，用系统自带的 `csc.exe` 编译，不依赖 SDK 或第三方包。
+Windows 专用的 WinForms 常驻浮窗：无边框、半透明、屏幕顶部吸附，鼠标靠近展开，双击钉住。源码按职责分成 [Layout.cs](Layout.cs)（布局几何）、[Core.cs](Core.cs)（配置与取数）、[Ui.cs](Ui.cs)（版式与自绘）、[Form.cs](Form.cs)（窗口行为）四个文件，编译产物仍是单个 EXE，用系统自带的 `csc.exe` 编译，不依赖 SDK 或第三方包。
 
 ## 功能
 
@@ -44,7 +44,7 @@ build.bat
 ```bash
 /mnt/c/Windows/Microsoft.NET/Framework64/v4.0.30319/csc.exe /nologo /target:winexe /platform:anycpu \
   /r:System.dll /r:System.Core.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll \
-  /codepage:65001 /win32icon:"$(wslpath -w app.ico)" /out:"C:\path\to\Milkman.exe" "$(wslpath -w Main.cs)"
+  /codepage:65001 /win32icon:"$(wslpath -w app.ico)" /out:"C:\path\to\Milkman.exe" "$(wslpath -w Layout.cs)" "$(wslpath -w Core.cs)" "$(wslpath -w Ui.cs)" "$(wslpath -w Form.cs)"
 ```
 
 ## 配置
@@ -98,7 +98,7 @@ build.bat
 
 ## 启动开销与回归检查
 
-JSON 读写使用 [Main.cs](<Main.cs>) 中的轻量值树实现，不加载 ASP.NET 序列化组件。配置已明确账户列表时不再探测默认认证路径；自启注册表值未变化时不重复写入。点击「获取用量」之前，不初始化网络 TLS、不发用量请求、不启动定时刷新或倒计时重绘。吸附静止时每 100 ms 检查一次鼠标位置，滑动动画保持 30 ms 步进。
+JSON 读写使用 [Core.cs](<Core.cs>) 中的轻量值树实现，不加载 ASP.NET 序列化组件。配置已明确账户列表时不再探测默认认证路径；自启注册表值未变化时不重复写入。点击「获取用量」之前，不初始化网络 TLS、不发用量请求、不启动定时刷新或倒计时重绘。吸附静止时每 100 ms 检查一次鼠标位置，滑动动画保持 30 ms 步进。
 
 在 Windows 中运行：
 
@@ -106,7 +106,14 @@ JSON 读写使用 [Main.cs](<Main.cs>) 中的轻量值树实现，不加载 ASP.
 tests\run.bat
 ```
 
-[JsonRegression.cs](<tests/JsonRegression.cs>) 使用合成数据检查配置兼容性（含空值回落、账户 null 过滤）、授权 JSON 未知字段与数字精度、非法输入、并发读写、`last_refresh` 的 RFC3339 时间戳格式、各来源的首次取数与失败重试状态，以及与原序列化器的差分结果；不读取真实认证文件、不请求 API。测试程序才会引用旧序列化组件作为对照，正式程序不依赖它。
+[JsonRegression.cs](<tests/JsonRegression.cs>) 使用合成数据检查配置兼容性（含空值回落、账户 null 过滤）、授权 JSON 未知字段与数字精度、非法输入、并发读写、`last_refresh` 的 RFC3339 时间戳格式、各来源的首次取数与失败重试状态、版式对齐规则，以及与原序列化器的差分结果；不读取真实认证文件、不请求 API。测试程序才会引用旧序列化组件作为对照，正式程序不依赖它。
+
+界面改动可以先用 [StateShots.cs](<tests/StateShots.cs>) 离屏渲染各个状态（启动、获取中、成功、失败、部分失败）再上桌面确认，它不显示窗口、不请求网络：
+
+```bat
+csc /nologo /codepage:65001 /target:exe /main:StateShots /r:System.dll /r:System.Core.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll /out:%TEMP%\StateShots.exe Layout.cs Core.cs Ui.cs Form.cs tests\StateShots.cs
+%TEMP%\StateShots.exe %TEMP%\milkman-states
+```
 
 ## 已知限制
 
