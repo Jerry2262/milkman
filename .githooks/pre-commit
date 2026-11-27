@@ -1,0 +1,14 @@
+#!/bin/sh
+# 提交前强制跑 Windows 合成回归。本仓库测试依赖系统自带 csc.exe，只能在 Windows 侧执行。
+# 在 WSL 里提交时通过 cmd.exe 调用，命令行带 UNC 警告属正常现象。
+cd "$(dirname "$0")/.." || exit 1
+
+if ! command -v cmd.exe >/dev/null 2>&1; then
+  echo "pre-commit: 找不到 cmd.exe，跳过回归（请在 Windows 侧手动运行 tests/run.bat）" >&2
+  exit 0
+fi
+
+if ! cmd.exe /d /c "$(wslpath -w "$PWD/tests/run.bat")" 2>/dev/null; then
+  echo "pre-commit: tests/run.bat 未通过，提交已阻止。" >&2
+  exit 1
+fi

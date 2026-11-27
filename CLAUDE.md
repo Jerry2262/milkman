@@ -33,14 +33,16 @@ powershell.exe -NoProfile -Command 'Start-Process "$env:LOCALAPPDATA\Milkman\Mil
 ## 架构（单文件 Main.cs，按 region 组织）
 
 - `Program` — 入口；检查自启注册表；`DataDir()` = `%LOCALAPPDATA%\Milkman`
-- `Config` — 显式字段映射读写 `config.json`（窗口 X/Y、Docked、RefreshSeconds、ChatGptAuthPath、OpenCodeAccounts、CommandCode）；程序固定开机自启，不设配置开关；解析失败回落默认并备份 `config.json.bad`；新增字段需同步 `Parse()` / `ToDictionary()`，否则会静默读不到/存不住
+- `Config` — 显式字段映射读写 `config.json`（`Monitor/OffsetX/OffsetY` 位置锚点、Docked、RefreshSeconds、ChatGptAuthPath、OpenCodeAccounts、CommandCode）；程序固定开机自启，不设配置开关；解析失败回落默认并备份 `config.json.bad`；新增字段需同步 `Parse()` / `ToDictionary()`，否则会静默读不到/存不住；写盘固定无 BOM 的 UTF-8（`SaveTo`），带 BOM 会损坏中文账户名
 - `DataFetcher` — 无状态网络层；`FetchGpt()`、每个 `FetchGo(account)` 与 `FetchCommandCode(cfg)` 可并行调用；JSON 字段统一安全读取，轻量 JSON 值树逐调用独立解析，不依赖 ASP.NET 或共享序列化器锁；错误消息截断 80 字
 - `MilkmanForm` — 自绘 UI + 行为：
   - 版式：宽 520，高度 = `16 + (行数 + 1) × GoRowH(76)`，行数 = OpenCode 账户数 +（配置了 `CommandCode` 则 +1）；`OpenCodeAccounts` 留空、`CommandCode` 为 null 都表示未订阅、对应区块隐藏；ChatGPT 按实际窗口数分 1–3 段；Brush/Pen/BandPath 缓存复用，低频动态文本直接测量，禁止缓存不断变化的倒计时字符串
   - 吸附：`WM_NCHITTEST`→`HTCAPTION` 系统级拖动；`WM_ENTERSIZEMOVE/EXITSIZEMOVE` 判定出入吸附（Top≤monTop+8 吸附，>monTop+30 脱离）；静止时 `DockTick` 每 100ms 采样，滑动用 30ms 缓出（dy/3，`Peek=5`）；双击 Pin 后立即展开并停止 DockTimer，取消 Pin 时恢复
-  - 独立刷新：每个 `SourceRow` 维护自己的 busy/auto/error/last-success，共用 `_refreshTimer`、后台派发、绘制和点击命中逻辑。每次启动等待一次「获取全部额度」；点击后为 HTTPS 启用 TLS 1.2，并发加载所有已配置来源，成功的来源进入定时刷新；失败只暂停自身并保留旧数据，单击该行「重试」恢复。
+  - 独立刷新：每个 `SourceRow` 维护自己的 busy/auto/error/last-success，共用 `_refreshTimer`、后台派发、绘制和点击命中逻辑。每次启动等待一次「获取用量」；点击后为 HTTPS 启用 TLS 1.2，并发加载所有已配置来源，成功的来源进入定时刷新；失败只暂停自身并保留旧数据，单击该行「重试」恢复。
   - 置顶：`TopMost = true` 只让 WinForms 在**创建之后**用 `SetWindowPos` 补设一层，而后台启动（开机自启、被别的进程拉起）时这个调用会被系统的 z-order 前台锁静默忽略——窗口就永远不置顶，表现为"有时置顶有时不置顶"。所以 `CreateParams` 里直接带 `WS_EX_TOPMOST`，窗口创建即置顶，与是否前台无关；`EnsureTopMost()` 再在 `WM_WINDOWPOSCHANGED` / `WM_STYLECHANGED(GWL_EXSTYLE)` 与 `OnShown` 后补一次丢失的标志（不轮询、不抢焦点）
-  - 多屏：`monRect` 可能为负坐标屏（副屏在顶部），坐标计算要考虑
+  - 多屏：位置状态是「显示器设备名 + 相对该屏的偏移」（`Config.Monitor/OffsetX/OffsetY`），不是绝对像素。换屏、改分辨率、改缩放都走 `ApplyLayout`／`AnchorTo`，不做逐屏特判；`monRect` 可能为负坐标屏。吸附资格由 `CanDock` 判定：顶边外侧还有屏幕覆盖时不吸附，否则收起的浮窗会压到相邻屏。
+  - DPI：几何常量与字号共用 144 基准，`_scale = dpi / 144`。**两者必须同乘同除**——只改字号或只改几何会让文字与版面比例失衡。文字按物理像素绘制并绕开画布缩放（`DrawText`），否则字形微调被压缩变换破坏。
+  - 跨屏重排：`WM_DPICHANGED` 必须按 `lParam` 给出的建议矩形，用**一次** `SetWindowPos` 完成，不要在消息里再自行推导锚点；否则尺寸变化与位置推导互相反馈，拖动跨屏会来回闪动。
 - `Json` — 同文件内的标准 JSON 读写；保留未知授权字段的数字词法，避免装载 ASP.NET。改动 `Json` / `Config` / 响应解析后必须跑 `tests\run.bat`（仅合成数据）。
 - `AutoStart` — HKCU Run 的 `Milkman` 键，仅路径变化时写入
 
@@ -54,3 +56,4 @@ powershell.exe -NoProfile -Command 'Start-Process "$env:LOCALAPPDATA\Milkman\Mil
 6. **config.json 边界**：解析器只接受标准 JSON（单引号、无引号键会被拒绝）；`null` 数值字段回落默认值，`RefreshSeconds` ≤0 或换算为毫秒会溢出时回落 60；解析失败会把原文件备份为 `config.json.bad` 并回落默认配置；`OpenCodeAccounts` 里的 null 元素会被忽略
 7. **Command Code 响应坑**：`windowLimits.*.resetAt` 是 epoch 毫秒、0 表示滚动窗口尚未开始（显示“未开始”）；`monthlyCredits` 是**剩余**不是已用；`monthlyCreditsGranted` 可能不返回，缺它时月度分母靠套餐表兜底（`individual-goat`=70），套餐也取不到就只在月度版位显示 `—`；`/alpha/*` 是 CLI 内部接口，字段随时可能变
 8. **refresh_token 一次性**：`oauth/token` 每刷新一次就换发新的 `refresh_token` 并作废旧的，响应里的 `refresh_token` / `id_token` 必须和 `access_token` 一起写回。只写 `access_token` 会让文件里的 RT 变成废的，且症状要等 access_token 到期（约 10 天）才出现——表现为 `刷新失败: refresh_token_reused`，只能重新登录。多台机器也别共用同一份 `auth.json`
+9. **改配置文件只用程序自己的写入路径**：手工改写 `config.json` 时用无 BOM 的 UTF-8。PowerShell 5 的 `Set-Content -Encoding UTF8` 会写 BOM，中文账户名会被写坏（曾实际发生过）。`tests/JsonRegression.cs` 的 `CheckConfigEncoding` 守着这条

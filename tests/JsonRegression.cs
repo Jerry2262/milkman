@@ -76,7 +76,7 @@ static class JsonRegression
         var first = session.Rows[0];
         Check(!session.RefreshDue() && network == 0 && dispatched.Count == 0
             && session.Rows.FindAll(r => session.ActionText(r) != null).Count == 1
-            && session.ActionText(first) == "获取全部额度", "startup waits for one shared action");
+            && session.ActionText(first) == "获取用量", "startup waits for one shared action");
         Check(session.Click(first) && !session.Click(first) && network == 1
             && dispatched.Count == session.Rows.Count && session.Rows.TrueForAll(r => r.Busy && dispatched.Contains(r)),
             "first click dispatches every configured source once");
@@ -97,8 +97,109 @@ static class JsonRegression
         Check(session.RefreshDue() && dispatched.Count == 1 && dispatched[0] == failed && first.Result == cached
             && session.HasCountdown(999) && !session.HasCountdown(1000), "recovered row resumes and stale data counts down until expiry");
     }
+    // 位置模型：显示器身份 + 相对偏移。覆盖单屏、双屏、副屏在顶部/左侧、屏消失、工作区夹取。
+    static void CheckPlacement() {
+        var size = new System.Drawing.Size(520,244);
+        var primary   = new System.Drawing.Rectangle(0,0,1920,1128);
+        var upper     = new System.Drawing.Rectangle(0,-1440,2560,1392);
+        var left      = new System.Drawing.Rectangle(-1920,0,1920,1080);
+        var tiny      = new System.Drawing.Rectangle(0,0,800,600);
+
+        // 单屏：偏移就是相对主屏的位置
+        Check(MilkmanForm.AnchorTo(primary,new System.Drawing.Point(100,200),size,false)==new System.Drawing.Point(100,200),
+            "single screen keeps the anchor offset");
+
+        // 副屏在顶部(负坐标)：同一锚点语义不变
+        Check(MilkmanForm.AnchorTo(upper,new System.Drawing.Point(300,140),size,false)==new System.Drawing.Point(300,-1300),
+            "upper screen resolves negative coordinates from its own origin");
+
+        // 副屏在左侧：坐标系原点不同，偏移语义一致
+        Check(MilkmanForm.AnchorTo(left,new System.Drawing.Point(120,150),size,false)==new System.Drawing.Point(-1800,150),
+            "left screen keeps the same relative offset");
+
+        // 分辨率变小：偏移超出可见范围时被夹回工作区
+        Check(MilkmanForm.AnchorTo(tiny,new System.Drawing.Point(1700,1000),size,false)==new System.Drawing.Point(280,356),
+            "offset beyond a shrunken screen is clamped into view");
+
+        // 吸附态：纵向贴屏幕顶边，横向超出时仍被夹回可见范围
+        Check(MilkmanForm.AnchorTo(upper,new System.Drawing.Point(2400,900),size,true)==new System.Drawing.Point(2040,-1440),
+            "docked placement pins to the screen top edge");
+
+        // 窗口比工作区还宽时不产生负坐标
+        Check(MilkmanForm.AnchorTo(new System.Drawing.Rectangle(0,0,400,400),new System.Drawing.Point(0,0),size,false).X==0,
+            "screen narrower than the window stays at the left edge");
+
+        // 屏消失：按名字找不到返回 null，调用方回落主屏
+        var findScreen = typeof(MilkmanForm).GetMethod("FindScreen", Private);
+        Check((object)findScreen.Invoke(null,new object[]{"\\\\.\\DISPLAY9"})==null,"missing monitor resolves to null");
+        Check((object)findScreen.Invoke(null,new object[]{""})==null,"empty monitor name resolves to null");
+
+        // 吸附资格：只有顶边外侧没有其它屏幕覆盖时才允许吸附
+        var top    = new System.Drawing.Rectangle(0,-1440,2560,1440); // 上方副屏
+        var bottom = new System.Drawing.Rectangle(0,0,1920,1200);      // 主屏，顶边正好是副屏底边
+        var side   = new System.Drawing.Rectangle(1920,0,1280,800);    // 主屏右侧，同样被副屏横跨
+        var alone  = new System.Drawing.Rectangle(0,0,1920,1200);
+
+        // 用户当前的布局：副屏在主屏正上方，因此主屏不能吸附，副屏可以
+        Check(!MilkmanForm.CanDock(bottom,new[]{top,bottom}),"main screen cannot dock when another screen sits directly above");
+        Check(MilkmanForm.CanDock(top,new[]{top,bottom}),"upper screen can dock because nothing is above it");
+
+        // 只有一块屏时总是可以吸附
+        Check(MilkmanForm.CanDock(alone,new[]{alone}),"single screen can always dock");
+
+        // 上方有屏但横向不重叠，互不影响
+        var farAbove = new System.Drawing.Rectangle(3000,-1440,1280,800);
+        Check(MilkmanForm.CanDock(alone,new[]{alone,farAbove}),"a screen above but horizontally apart does not block docking");
+
+        // 右侧屏也在副屏覆盖范围内
+        Check(!MilkmanForm.CanDock(side,new[]{top,bottom,side}),"screen spanned by an upper display cannot dock");
+
+        // 位于下方的那块屏不会阻止上方屏吸附
+        Check(MilkmanForm.CanDock(top,new[]{top,bottom,side}),"lower screens never block docking above them");
+    }
+
+    // 配置文件编码：必须是无 BOM 的 UTF-8，且非 ASCII（中文账户名）往返后不变。
+    // 这直接对应一次真实事故：外部工具以带 BOM 的 UTF-8 改写配置后账户名损坏。
+    static void CheckConfigEncoding() {
+        string dir=System.IO.Path.Combine(System.IO.Path.GetTempPath(),"Milkman-enc-"+Guid.NewGuid().ToString("N"));
+        string path=System.IO.Path.Combine(dir,"config.json");
+        try {
+            var cfg=new Config();
+            cfg.Monitor=@"\\.\DISPLAY2";
+            cfg.OffsetX=1182; cfg.OffsetY=855; cfg.Docked=false;
+            cfg.OpenCodeAccounts.Add(new OpenCodeAccountConfig { Name="个人", Key="oc_sk_fixture", AuthPath="" });
+            Check(cfg.SaveTo(path),"config saves to a temporary path");
+
+            byte[] raw=System.IO.File.ReadAllBytes(path);
+            Check(!(raw.Length>=3 && raw[0]==0xEF && raw[1]==0xBB && raw[2]==0xBF),"config is written without a BOM");
+            Check(raw[0]=='{',"config starts with '{', not a byte-order mark");
+
+            // 中文与原样字节必须完整落盘
+            string text=System.Text.Encoding.UTF8.GetString(raw);
+            Check(text.Contains("个人"),"non-ASCII account names survive the write");
+            byte[] nameBytes=System.Text.Encoding.UTF8.GetBytes("个人");
+            Check(IndexOf(raw,nameBytes)>=0,"account name is stored as canonical UTF-8 bytes");
+
+            // 读回后内容一致（往返不丢中文字段）
+            var loaded=Config.Parse(text);
+            Check(loaded.OpenCodeAccounts.Count==1 && loaded.OpenCodeAccounts[0].Name=="个人","config round-trips a Chinese account name");
+            Check(loaded.Monitor==@"\\.\DISPLAY2" && loaded.OffsetX==1182 && loaded.OffsetY==855,"config round-trips the placement anchor");
+        } finally { if (System.IO.Directory.Exists(dir)) System.IO.Directory.Delete(dir,true); }
+    }
+
+    static int IndexOf(byte[] haystack, byte[] needle) {
+        for (int i=0; i+needle.Length<=haystack.Length; i++) {
+            int j=0;
+            while (j<needle.Length && haystack[i+j]==needle[j]) j++;
+            if (j==needle.Length) return i;
+        }
+        return -1;
+    }
+
     static void Main() {
         CheckRefreshRows();
+        CheckPlacement();
+        CheckConfigEncoding();
         System.Threading.Thread.CurrentThread.CurrentCulture = new CultureInfo("fr-FR");
         foreach (var json in new[] {
             "null", "true", "false", "123", "-2147483649", "9223372036854775807", "1.25", "1e-3",
@@ -162,36 +263,34 @@ static class JsonRegression
         float single=1.23456789f;
         Check(Convert.ToSingle(Read(Write(single)),CultureInfo.InvariantCulture)==single,"float roundtrip precision");
         var defaults=Config.Parse("{\"OpenCodeAccounts\":[]}");
-        Check(defaults.X == -1 && defaults.Y == -1 && defaults.RefreshSeconds == 60 && !defaults.Docked && defaults.OpenCodeAccounts.Count == 0,"configuration defaults and explicit empty accounts");
+        Check(defaults.Monitor=="" && defaults.OffsetX == -1 && defaults.OffsetY == -1 && defaults.RefreshSeconds == 60 && !defaults.Docked && defaults.OpenCodeAccounts.Count == 0,"configuration defaults and explicit empty accounts");
         Check(Config.Parse("{\"OpenCodeAccounts\":null}").OpenCodeAccounts.Count==0,"explicit null accounts");
-        var nullValues=Config.Parse("{\"X\":null,\"Y\":null,\"Docked\":null,\"RefreshSeconds\":null}");
-        Check(nullValues.X==-1 && nullValues.Y==-1 && !nullValues.Docked && nullValues.RefreshSeconds==60,"config null values fall back to defaults");
+        var nullValues=Config.Parse("{\"Monitor\":null,\"OffsetX\":null,\"OffsetY\":null,\"Docked\":null,\"RefreshSeconds\":null}");
+        Check(nullValues.Monitor=="" && nullValues.OffsetX==-1 && nullValues.OffsetY==-1 && !nullValues.Docked && nullValues.RefreshSeconds==60,"config null values fall back to defaults");
         Check(Config.Parse("{\"RefreshSeconds\":0}").RefreshSeconds==60,"zero refresh interval falls back to default");
         Check(Config.Parse("{\"RefreshSeconds\":-30}").RefreshSeconds==60,"negative refresh interval falls back to default");
         Check(Config.Parse("{\"RefreshSeconds\":2147484,\"OpenCodeAccounts\":[]}").RefreshSeconds==60,"overflowing timer interval falls back");
         Check(Config.Parse("{\"RefreshSeconds\":2147483,\"OpenCodeAccounts\":[]}").RefreshSeconds==2147483,"largest supported whole-second interval");
-        var oversizedInterval=Config.Parse("{\"RefreshSeconds\":2147483648,\"X\":42,\"OpenCodeAccounts\":[]}");
-        Check(oversizedInterval.RefreshSeconds==60 && oversizedInterval.X==42,"out-of-range interval does not discard other settings");
-        var dockScreen=typeof(MilkmanForm).GetMethod("DockMonitorIndex", Private);
-        var screens=new[] { new System.Drawing.Rectangle(0,0,1920,1080), new System.Drawing.Rectangle(0,-1080,1920,1080), new System.Drawing.Rectangle(-1920,0,1920,1080) };
-        Check(dockScreen!=null && (int)dockScreen.Invoke(null,new object[]{new System.Drawing.Rectangle(100,-1080,520,244),screens})==1,"restore docked upper screen");
-        Check((int)dockScreen.Invoke(null,new object[]{new System.Drawing.Rectangle(100,-1319,520,244),screens})==1,"restore legacy collapsed upper screen");
-        Check((int)dockScreen.Invoke(null,new object[]{new System.Drawing.Rectangle(-900,-239,520,244),screens})==2,"restore legacy collapsed left screen");
+        var oversizedInterval=Config.Parse("{\"RefreshSeconds\":2147483648,\"OffsetX\":42,\"OpenCodeAccounts\":[]}");
+        Check(oversizedInterval.RefreshSeconds==60 && oversizedInterval.OffsetX==42,"out-of-range interval does not discard other settings");
+        // 旧版绝对像素 X/Y 已废弃：读到也不影响新模型，位置回落到主屏
+        var oldPixels=Config.Parse("{\"X\":2438,\"Y\":-2160,\"Docked\":true,\"OpenCodeAccounts\":[]}");
+        Check(oldPixels.Monitor=="" && oldPixels.OffsetX==-1 && oldPixels.OffsetY==-1 && oldPixels.Docked,"legacy pixel coordinates are dropped in favour of the anchor model");
         var nullAccounts=Config.Parse("{\"OpenCodeAccounts\":[null,{\"Name\":\"only\"}]}");
         Check(nullAccounts.OpenCodeAccounts.Count==1 && nullAccounts.OpenCodeAccounts[0].Name=="only","null account entries ignored");
         string stampText=Program.NowRfc3339();
         DateTimeOffset stamp;
         Check(stampText.Length==30 && stampText.EndsWith("Z")
           && DateTimeOffset.TryParse(stampText,CultureInfo.InvariantCulture,DateTimeStyles.RoundtripKind,out stamp),"last_refresh RFC3339 format");
-        string config="{\"x\":42,\"Y\":-2160,\"DOCKED\":true,\"RefreshSeconds\":90,\"ChatGptAuthPath\":\"C:\\\\fixture\\\\codex\\\\auth.json\",\"OpenCodeAccounts\":[{\"name\":\"测试🥛\",\"Key\":\"fixture-key\",\"AuthPath\":\"C:\\\\fixture\\\\auth.json\"}]}";
+        string config="{\"Monitor\":\"\\\\\\\\.\\\\DISPLAY2\",\"OffsetX\":42,\"OffsetY\":-1080,\"DOCKED\":true,\"RefreshSeconds\":90,\"ChatGptAuthPath\":\"C:\\\\fixture\\\\codex\\\\auth.json\",\"OpenCodeAccounts\":[{\"name\":\"测试🥛\",\"Key\":\"fixture-key\",\"AuthPath\":\"C:\\\\fixture\\\\auth.json\"}]}";
         var cfg=Config.Parse(config);
-        Check(cfg.X==42 && cfg.Y==-2160 && cfg.Docked && cfg.RefreshSeconds==90,"config numbers and case insensitive fields");
+        Check(cfg.Monitor=="\\\\.\\DISPLAY2" && cfg.OffsetX==42 && cfg.OffsetY==-1080 && cfg.Docked && cfg.RefreshSeconds==90,"config numbers and case insensitive fields");
         Check(cfg.ChatGptAuthPath=="C:\\fixture\\codex\\auth.json","chatgpt auth path");
         Check(Config.Parse("{}").ChatGptAuthPath=="","chatgpt auth path defaults to empty");
         Check(cfg.OpenCodeAccounts.Count==1 && cfg.OpenCodeAccounts[0].Name=="测试🥛" && cfg.OpenCodeAccounts[0].Key=="fixture-key","account fields");
         var dictionary=typeof(Config).GetMethod("ToDictionary", BindingFlags.NonPublic|BindingFlags.Instance).Invoke(cfg,null);
         var saved=Config.Parse(Write(dictionary));
-        Check(saved.X==cfg.X && saved.Y==cfg.Y && saved.OpenCodeAccounts[0].AuthPath==cfg.OpenCodeAccounts[0].AuthPath,"config save roundtrip");
+        Check(saved.Monitor==cfg.Monitor && saved.OffsetX==cfg.OffsetX && saved.OffsetY==cfg.OffsetY && saved.OpenCodeAccounts[0].AuthPath==cfg.OpenCodeAccounts[0].AuthPath,"config save roundtrip");
         Check(saved.ChatGptAuthPath==cfg.ChatGptAuthPath,"chatgpt auth path roundtrip");
         bool depthRejected=false;
         try { Read(new string('[',102)+"0"+new string(']',102)); } catch { depthRejected=true; }

@@ -24,7 +24,7 @@ namespace Milkman
     [STAThread]
     static void Main()
     {
-      NativeMethods.SetProcessDPIAware();
+      NativeMethods.EnablePerMonitorDpi(); // 每屏 DPI 原生渲染，避免被系统位图拉伸
       Application.EnableVisualStyles();
       Application.SetCompatibleTextRenderingDefault(false);
       AutoStart.Ensure(); // 固定开机自启；每次启动同时刷新注册表中的 exe 路径
@@ -52,7 +52,40 @@ namespace Milkman
   static class NativeMethods
   {
     [System.Runtime.InteropServices.DllImport("user32.dll")]
-    public static extern bool SetProcessDPIAware();
+    static extern bool SetProcessDpiAwarenessContext(IntPtr context);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    static extern bool SetProcessDPIAware();
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    static extern IntPtr MonitorFromPoint(POINT pt, int flags);
+
+    [System.Runtime.InteropServices.DllImport("shcore.dll")]
+    static extern int GetDpiForMonitor(IntPtr monitor, int type, out uint dpiX, out uint dpiY);
+
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+    public struct POINT { public int X, Y; }
+
+    // PER_MONITOR_AWARE_V2 = -4：窗口按所在显示器自己的缩放渲染（Win10 1703+），
+    // 系统不再把它当位图缩放，多屏混合 DPI 时既不模糊也不会尺寸错位。
+    public static void EnablePerMonitorDpi()
+    {
+      try { if (SetProcessDpiAwarenessContext(new IntPtr(-4))) return; } catch { }
+      try { SetProcessDPIAware(); } catch { } // 旧系统退化为系统级感知
+    }
+
+    // 目标显示器区域的实际 DPI；取不到按 96(100%) 处理
+    public static int DpiOf(Rectangle bounds)
+    {
+      try
+      {
+        var pt = new POINT { X = bounds.Left + bounds.Width / 2, Y = bounds.Top + bounds.Height / 2 };
+        uint dx, dy;
+        if (GetDpiForMonitor(MonitorFromPoint(pt, 2), 0, out dx, out dy) == 0 && dx > 0) return (int)dx;
+      }
+      catch { }
+      return 96;
+    }
 
     [System.Runtime.InteropServices.DllImport("dwmapi.dll")]
     public static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int val, int size);
@@ -102,7 +135,11 @@ namespace Milkman
   // 注意：新增配置字段时必须同时更新 Parse() 与 ToDictionary()，否则该字段会静默读不到/存不住。
   class Config
   {
-    public int X = -1, Y = -1;
+    // 位置状态以「显示器 + 相对该屏左上角的偏移」保存：显示器分辨率、DPI 或整体布局变化后
+    // 这些值依然有效，不需要为单屏/双屏/来回切换分别适配。Monitor 为空表示旧配置或首次运行，
+    // 位置重置到主屏。旧版按绝对像素存的 X/Y 已废弃，读到也丢弃。
+    public string Monitor = "";
+    public int OffsetX = -1, OffsetY = -1;
     public bool Docked = false;
     public int RefreshSeconds = 60;
     // 留空 = %USERPROFILE%\.codex\auth.json；填了只认填的那一份（可以指向 WSL 里的路径）
@@ -135,11 +172,18 @@ namespace Milkman
 
     public bool Save()
     {
+      return SaveTo(Path.Combine(Program.DataDir(), "config.json"));
+    }
+
+    // 写入指定路径，供测试用临时文件验证编码。始终写无 BOM 的 UTF-8：
+    // 带 BOM 会让其他工具读到的首字符异常，中文账户名随即损坏。
+    internal bool SaveTo(string path)
+    {
       try
       {
-        Directory.CreateDirectory(Program.DataDir());
-        File.WriteAllText(Path.Combine(Program.DataDir(), "config.json"),
-          Json.Serialize(ToDictionary()), new UTF8Encoding(false));
+        string dir = Path.GetDirectoryName(path);
+        if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+        File.WriteAllText(path, Json.Serialize(ToDictionary()), new UTF8Encoding(false));
         return true;
       }
       catch { return false; }
@@ -150,8 +194,10 @@ namespace Milkman
       var d = ConfigObject(Json.Parse(json));
       var cfg = new Config();
       object value;
-      if (d.TryGetValue("X", out value) && value != null) cfg.X = Convert.ToInt32(value, CultureInfo.InvariantCulture);
-      if (d.TryGetValue("Y", out value) && value != null) cfg.Y = Convert.ToInt32(value, CultureInfo.InvariantCulture);
+      if (d.TryGetValue("Monitor", out value) && value != null)
+        cfg.Monitor = Convert.ToString(value, CultureInfo.InvariantCulture);
+      if (d.TryGetValue("OffsetX", out value) && value != null) cfg.OffsetX = Convert.ToInt32(value, CultureInfo.InvariantCulture);
+      if (d.TryGetValue("OffsetY", out value) && value != null) cfg.OffsetY = Convert.ToInt32(value, CultureInfo.InvariantCulture);
       if (d.TryGetValue("Docked", out value) && value != null) cfg.Docked = Convert.ToBoolean(value, CultureInfo.InvariantCulture);
       if (d.TryGetValue("RefreshSeconds", out value) && value != null)
       {
@@ -212,7 +258,8 @@ namespace Milkman
         { "Name", CommandCode.Name }, { "Key", CommandCode.Key }
       };
       return new Dictionary<string, object> {
-        { "X", X }, { "Y", Y }, { "Docked", Docked }, { "RefreshSeconds", RefreshSeconds },
+        { "Monitor", Monitor }, { "OffsetX", OffsetX }, { "OffsetY", OffsetY },
+        { "Docked", Docked }, { "RefreshSeconds", RefreshSeconds },
         { "ChatGptAuthPath", ChatGptAuthPath },
         { "OpenCodeAccounts", accounts }, { "CommandCode", commandCode }
       };
@@ -867,9 +914,25 @@ namespace Milkman
         GptBandPaths[count - 1] = CreateBandPaths(BandTop1, count);
     }
 
-    // 字体层次（参照 DeepSeekTimeline）
-    readonly Font fontBig, fontMid, fontTick;
-    readonly Rectangle closeRect = new Rectangle(W - 26, 7, 15, 15);
+    // 字体层次（参照 DeepSeekTimeline）。
+    // 中文/英文分用两款字体：拉丁字符用 Segoe UI（Windows 原生 UI 字体，字形紧凑），
+    // 中文用微软雅黑（雅黑 UI 变体字形偏窄）。两者各自按目标屏幕实际像素重建，
+    // 并在绘制时绕开画布缩放，让 GDI+ 去做字形微调。
+    Font fontBig, fontMid, fontTick;      // 中文
+    Font latinBig, latinMid, latinTick;   // 拉丁字符
+    // 字体与几何共用 144 DPI 基准：这些是 144 下的像素，乘 _scale 得到该屏真实字号。
+    const int BigDesignPx = 24, MidDesignPx = 18, TickDesignPx = 15;
+    // 中英文分用两款字体：拉丁字符用 Segoe UI，中文用微软雅黑。
+    // 两款都是 Windows 自带，无需携带字体文件。
+    const string LatinFace = "Segoe UI";
+    const string CjkFace = "Microsoft YaHei UI";
+    // 缩放系数：窗口按所在显示器 DPI 相对 144 基准缩放。版面一直是按 150% 显示器调校的，
+    // 用 144 作基准就能在 100% 屏上回到原来的观感（520→347），在 150% 屏上保持原尺寸（520）。
+    const int BaseDpi = 144;
+    float _scale = 1f;
+    int _designH;   // 设计单位高度
+    int _formH;     // 实际像素高度
+    Rectangle closeRect = new Rectangle(W - 26, 7, 15, 15);
     bool hoverClose;
     SourceRow _hoverAction;
 
@@ -880,7 +943,12 @@ namespace Milkman
     const int GWL_EXSTYLE = -20, WS_EX_TOPMOST = 0x00000008;
     const int WM_SYSCOMMAND = 0x112, SC_MAXIMIZE = 0xF030;
     const int WM_NCLBUTTONDBLCLK = 0xA3;
-    const int Peek = 5; // 吸附收起时顶部保留的提示条高度(px), 与 DeepSeekTimeline 一致
+    const int WM_DPICHANGED = 0x02E0;
+    // 吸附收起时顶部保留的提示条高度。这是鼠标唯一能点到的目标，必须固定为实际像素，
+    // 不随 DPI 缩放：切成设计单位会在 100% 屏上缩成 3px，直接变得点不中。
+    const int Peek = 5;
+    // 收起时的窗口顶端：始终露出 Peek 个实际像素
+    int CollapsedTop { get { return monRect.Top - _formH + Peek; } }
     const int DockIdleMs = 100, DockAnimationMs = 30;
     bool docked, expanded, dragging, pinned; // pinned = 双击钉住, DockTick 不自动收放
     Rectangle monRect;
@@ -891,7 +959,6 @@ namespace Milkman
     readonly RefreshSession _refresh;
     Timer _refreshTimer = new Timer();
     Timer _clockTimer = new Timer();
-    int _formH;
 
     internal sealed class SourceRow
     {
@@ -940,7 +1007,7 @@ namespace Milkman
       }
       public string ActionText(SourceRow row)
       {
-        if (!Started) return row == Rows[0] ? "获取全部额度" : null;
+        if (!Started) return row == Rows[0] ? "获取用量" : null;
         return !row.Busy && row.Result.Error != null ? "重试" : null;
       }
       public bool Click(SourceRow row)
@@ -982,12 +1049,10 @@ namespace Milkman
         AddSource("OpenCode Go", account.Name, BrAccentOff, () => _fetcher.FetchGo(account));
       var cc = _cfg.CommandCode;
       if (cc != null) AddSource("Command Code", cc.Name, BrAccentCc, () => _fetcher.FetchCommandCode(cc));
-      _formH = 16 + _refresh.Rows.Count * GoRowH;
+      _designH = 16 + _refresh.Rows.Count * GoRowH;
 
-      fontBig = new Font("Microsoft YaHei UI", 12f, FontStyle.Bold);
-      fontMid = new Font("Microsoft YaHei UI", 9f, FontStyle.Regular);
-      fontTick = new Font("Microsoft YaHei UI", 7.5f, FontStyle.Regular);
-      Font = fontMid;
+      // 字体按屏幕实际像素创建（SetScale 里重建），这里先建一份初值
+      RebuildFonts();
 
       // ExtractAssociatedIcon 不接受 UNC 路径(网络共享/WSL 互操作路径启动), 抛 ArgumentException 会中断启动
       try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); }
@@ -1001,7 +1066,6 @@ namespace Milkman
       Opacity = 0.80; // 与 DeepSeek 一致
       SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint
         | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
-      Size = new Size(W, _formH);
       RestoreLocation();
 
 
@@ -1017,16 +1081,16 @@ namespace Milkman
 
       Load += (s, e) =>
       {
-        if (!_cfg.Docked) monRect = Screen.FromControl(this).Bounds;
-        if (_cfg.Docked)
-        {
-          docked = true;
-          expanded = false;
-          pinned = false;
-          Location = new Point(Location.X, monRect.Top - _formH + Peek);
-          _dockTimer.Start();
-        }
+        // 吸附状态已在 RestoreLocation 里按目标屏是否可吸附判定过，这里沿用
+        if (docked) { expanded = false; pinned = false; }
+        // 句柄就绪后按最终所在屏重算尺寸与位置（吸附态贴屏幕顶边）
+        ApplyLayout(Screen.FromControl(this),
+          new Point(Math.Max(0, _cfg.OffsetX), Math.Max(0, _cfg.OffsetY)));
+        if (docked) _dockTimer.Start();
       };
+      // 插拔屏幕、改分辨率或缩放的统一入口：重新解析所在屏并按锚点归位
+      Microsoft.Win32.SystemEvents.DisplaySettingsChanged += OnDisplayChanged;
+      FormClosing += (s, e) => Microsoft.Win32.SystemEvents.DisplaySettingsChanged -= OnDisplayChanged;
 
       _refreshTimer.Interval = _cfg.RefreshSeconds * 1000;
       _refreshTimer.Tick += (s, e) => { if (_refresh.RefreshDue()) RepaintUsage(); };
@@ -1048,7 +1112,7 @@ namespace Milkman
 
     void RepaintUsage()
     {
-      if (!docked || expanded || Top > monRect.Top - _formH + Peek) Invalidate();
+      if (!docked || expanded || Top > CollapsedTop) Invalidate();
     }
 
     static void EnableNetwork()
@@ -1105,6 +1169,24 @@ namespace Milkman
         EnsureTopMost();
         return;
       }
+      if (m.Msg == WM_DPICHANGED)
+      {
+        // 系统在 lParam 给出新 DPI 下的建议矩形。按微软要求用它一次性完成重排：
+        // 拖动跨屏时只重排一次，不回头按当前位置反推锚点，否则会和尺寸变化互相反馈、来回抖动。
+        int dpi = (int)(m.WParam.ToInt64() & 0xFFFF);
+        var suggested = (NativeMethods.RECT)System.Runtime.InteropServices.Marshal.PtrToStructure(
+          m.LParam, typeof(NativeMethods.RECT));
+        var box = new Rectangle(suggested.L, suggested.T, suggested.R - suggested.L, suggested.B - suggested.T);
+        monRect = Screen.FromRectangle(box).Bounds;
+        SetScale(dpi);
+        // 吸附态仍贴合屏幕顶边，拖动中的窗口跟手走建议位置
+        int y = docked ? (expanded ? monRect.Top : CollapsedTop) : suggested.T;
+        NativeMethods.SetWindowPos(Handle, IntPtr.Zero, suggested.L, y, Scaled(W), _formH,
+          0x0004 | 0x0010); // NOZORDER | NOACTIVATE
+        Invalidate();
+        m.Result = IntPtr.Zero;
+        return;
+      }
       if (m.Msg == WM_ENTERSIZEMOVE)
       {
         dragging = true;
@@ -1115,18 +1197,22 @@ namespace Milkman
       {
         // 拖拽结束: 判定 进入吸附 / 保持吸附 / 脱离吸附
         dragging = false;
-        monRect = Screen.FromControl(this).Bounds;
+        Screen target = Screen.FromControl(this);
         if (docked)
         {
-          if (Top > monRect.Top + 30) { docked = false; pinned = false; _dockTimer.Stop(); } // 下拉脱离
+          bool escaped = Top > target.Bounds.Top + Scaled(30);
+          // 拖到上方还有屏幕的显示器时不再吸附，浮窗回到可见的常规位置
+          if (escaped || !DockableOn(target.Bounds)) { docked = false; pinned = false; _dockTimer.Stop(); }
         }
-        else if (Top <= monRect.Top + 8)
+        else if (Top <= target.Bounds.Top + Scaled(8) && DockableOn(target.Bounds))
         {
           docked = true;                              // 拖到顶 = 吸附
           expanded = true;
-          Invalidate();
           _dockTimer.Start();
         }
+        // 尺寸随拖动已由 WM_DPICHANGED 按目标屏设好；这里只在吸附态归位到屏幕顶边
+        monRect = target.Bounds;
+        if (docked) Location = new Point(Left, CollapsedTop);
         SaveState();
         base.WndProc(ref m);
         return;
@@ -1136,7 +1222,7 @@ namespace Milkman
         int lp = (int)m.LParam;
         int sx = lp & 0xFFFF; if (sx >= 0x8000) sx -= 0x10000;
         int sy = (lp >> 16) & 0xFFFF; if (sy >= 0x8000) sy -= 0x10000;
-        Point pt = PointToClient(new Point(sx, sy));
+        Point pt = ToDesign(PointToClient(new Point(sx, sy)));
         m.Result = (IntPtr)(closeRect.Contains(pt) || ActionHit(pt) != null ? HTCLIENT : HTCAPTION);
         return;
       }
@@ -1173,8 +1259,9 @@ namespace Milkman
     void OnMouseDownHook(object sender, MouseEventArgs e)
     {
       if (e.Button != MouseButtons.Left) return;
-      if (closeRect.Contains(e.Location)) { Close(); return; } // ✕ = 退出程序
-      var row = ActionHit(e.Location);
+      Point p = ToDesign(e.Location);
+      if (closeRect.Contains(p)) { Close(); return; } // ✕ = 退出程序
+      var row = ActionHit(p);
       if (row != null && _refresh.Click(row))
       {
         _hoverAction = null;
@@ -1185,8 +1272,9 @@ namespace Milkman
 
     void OnMouseMoveHook(object sender, MouseEventArgs e)
     {
-      bool h = closeRect.Contains(e.Location);
-      var row = ActionHit(e.Location);
+      Point p = ToDesign(e.Location);
+      bool h = closeRect.Contains(p);
+      var row = ActionHit(p);
       if (h != hoverClose || row != _hoverAction)
       {
         hoverClose = h;
@@ -1221,59 +1309,134 @@ namespace Milkman
       EnsureTopMost(); // 显示完成后再确认一次原生置顶标志
     }
 
+    // 位置恢复：按保存的显示器名找屏，用相对该屏的偏移算坐标；该屏不在就退回主屏。
+    // 分辨率、DPI、整体布局怎么变都走同一条路径，不需要为单屏/多屏分别判断。
     void RestoreLocation()
     {
-      Point saved = new Point(_cfg.X, _cfg.Y);
-      Screen screen = Screen.PrimaryScreen;
-      if (saved == new Point(-1, -1))
-      {
-        Rectangle area = screen.WorkingArea;
-        saved = new Point(area.Right - W - 10, area.Bottom - _formH - 40);
-      }
-      else
-      {
-        var window = new Rectangle(saved, Size);
-        screen = Screen.FromRectangle(window);
-        if (_cfg.Docked)
-        {
-          Screen[] screens = Screen.AllScreens;
-          int index = DockMonitorIndex(window, Array.ConvertAll(screens, s => s.Bounds));
-          if (index >= 0) screen = screens[index];
-        }
-      }
+      Screen screen = FindScreen(_cfg.Monitor) ?? Screen.PrimaryScreen;
       monRect = screen.Bounds;
-      Rectangle target = _cfg.Docked ? monRect : screen.WorkingArea;
-      Location = new Point(Math.Max(target.Left, Math.Min(saved.X, target.Right - Width)),
-        _cfg.Docked ? target.Top : Math.Max(target.Top, Math.Min(saved.Y, target.Bottom - Height)));
+      Rectangle area = screen.WorkingArea;
+      ApplyScale();
+      // 配置里的吸附状态只在目标屏仍允许吸附时沿用，否则回到常规位置
+      bool canDock = _cfg.Docked && DockableOn(monRect);
+      if (_cfg.Docked && !canDock) docked = false;
+      if (_cfg.OffsetX < 0 || _cfg.OffsetY < 0)
+      {
+        // 首次运行或旧配置：靠右下角摆放
+        Location = new Point(area.Right - Width - 10, area.Bottom - _formH - 40);
+        return;
+      }
+      Location = AnchorTo(area, new Point(_cfg.OffsetX, _cfg.OffsetY), Size, canDock);
     }
 
-    static int DockMonitorIndex(Rectangle window, Rectangle[] screens)
+    // 按目标显示器的 DPI 设置缩放与窗口尺寸；绘制与命中测试都换算回 96 DPI 设计单位
+    void ApplyScale()
     {
-      // 新配置保存屏幕顶边；旧配置可能保存的是收起时的位置。
-      int index = -1, bestOverlap = 0;
-      bool exact = false;
-      for (int i = 0; i < screens.Length; i++)
+      SetScale(NativeMethods.DpiOf(monRect));
+      ClientSize = new Size(Scaled(W), _formH);
+    }
+
+    // 只更新缩放与尺寸数值，不碰窗口位置：位置由调用方一次性设定
+    void SetScale(int dpi)
+    {
+      _scale = dpi / (float)BaseDpi;
+      _formH = Scaled(_designH);
+      RebuildFonts();
+    }
+
+    // 字体按当前屏幕的实际像素重建；中英各一款，尺寸一致以保证基线对齐
+    void RebuildFonts()
+    {
+      var old = new[] { fontBig, fontMid, fontTick, latinBig, latinMid, latinTick };
+      float big = BigDesignPx * _scale, mid = MidDesignPx * _scale, tick = TickDesignPx * _scale;
+      fontBig = new Font(CjkFace, big, FontStyle.Bold, GraphicsUnit.Pixel);
+      fontMid = new Font(CjkFace, mid, FontStyle.Regular, GraphicsUnit.Pixel);
+      fontTick = new Font(CjkFace, tick, FontStyle.Regular, GraphicsUnit.Pixel);
+      latinBig = new Font(LatinFace, big, FontStyle.Bold, GraphicsUnit.Pixel);
+      latinMid = new Font(LatinFace, mid, FontStyle.Regular, GraphicsUnit.Pixel);
+      latinTick = new Font(LatinFace, tick, FontStyle.Regular, GraphicsUnit.Pixel);
+      Font = fontMid;
+      foreach (var f in old) if (f != null) f.Dispose();
+    }
+
+    int Scaled(int design) { return (int)Math.Round(design * _scale); }
+
+    // 客户端像素坐标 → 设计单位坐标
+    Point ToDesign(Point client)
+    {
+      return new Point((int)Math.Round(client.X / _scale), (int)Math.Round(client.Y / _scale));
+    }
+
+    static Screen FindScreen(string device)
+    {
+      if (string.IsNullOrEmpty(device)) return null;
+      foreach (var screen in Screen.AllScreens)
+        if (string.Equals(screen.DeviceName, device, StringComparison.OrdinalIgnoreCase)) return screen;
+      return null;
+    }
+
+    // 只有顶边外侧没有其它屏幕覆盖时才允许吸附：吸附会把窗口移到屏幕外，
+    // 若上方还有屏幕，收起的浮窗就会压到那块屏上。纯函数，便于直接验证。
+    internal static bool CanDock(Rectangle screen, Rectangle[] others)
+    {
+      foreach (var other in others)
       {
-        Rectangle screen = screens[i];
-        long aboveTop = (long)screen.Top - window.Top;
-        if (aboveTop < 0 || aboveTop > window.Height - Peek) continue;
-        int overlap = Math.Min(screen.Right, window.Right) - Math.Max(screen.Left, window.Left);
-        bool onTop = aboveTop == 0;
-        if (overlap <= 0 || (exact && !onTop) || (exact == onTop && overlap <= bestOverlap)) continue;
-        index = i;
-        bestOverlap = overlap;
-        exact = onTop;
+        if (other.Top + other.Height > screen.Top) continue;         // 该屏不在上方
+        if (other.Left >= screen.Right || other.Right <= screen.Left) continue; // 横向不相交
+        return false;
       }
-      return index;
+      return true;
+    }
+
+    // 把相对偏移约束在该屏工作区内，保证窗口始终可见可点。
+    // 纯函数：输入显示器区域、偏移、窗口尺寸与吸附状态，输出实际坐标，便于直接验证。
+    internal static Point AnchorTo(Rectangle area, Point offset, Size size, bool topEdge)
+    {
+      int x = Math.Max(area.Left, Math.Min(area.Left + offset.X, area.Right - size.Width));
+      int y = topEdge ? area.Top : Math.Max(area.Top, Math.Min(area.Top + offset.Y, area.Bottom - size.Height));
+      return new Point(x, y);
+    }
+
+    // 某块屏是否允许吸附：顶边外侧不能有其它屏幕
+    static bool DockableOn(Rectangle screen)
+    {
+      var all = Screen.AllScreens;
+      var others = new Rectangle[all.Length];
+      for (int i = 0; i < all.Length; i++) others[i] = all[i].Bounds;
+      return CanDock(screen, others);
+    }
+
+    // 统一的重新布局入口：换屏、改分辨率、改缩放、拖动结束都走这里。
+    // anchor 是相对目标屏左上角的偏移，尺寸随该屏 DPI 重算，吸附态贴屏幕顶边。
+    void ApplyLayout(Screen screen, Point anchor)
+    {
+      monRect = screen.Bounds;
+      ApplyScale();
+      Location = AnchorTo(screen.WorkingArea, anchor, Size, docked);
+      if (docked) Location = new Point(Location.X, CollapsedTop);
+    }
+
+    // 显示器布局变化：重新解析所在屏并按保存的锚点归位
+    void OnDisplayChanged(object sender, EventArgs e)
+    {
+      if (IsDisposed || !IsHandleCreated) return;
+      ApplyLayout(FindScreen(_cfg.Monitor) ?? Screen.FromControl(this),
+        new Point(Math.Max(0, _cfg.OffsetX), Math.Max(0, _cfg.OffsetY)));
+      Invalidate();
     }
 
     void SaveState()
     {
-      int x = Left, y = docked ? monRect.Top : Top;
-      if (_cfg.X == x && _cfg.Y == y && _cfg.Docked == docked) return;
+      Screen screen = Screen.FromControl(this);
+      Point offset = new Point(Left - screen.Bounds.Left, docked ? 0 : Top - screen.Bounds.Top);
+      if (_cfg.Monitor == screen.DeviceName && _cfg.OffsetX == offset.X
+        && _cfg.OffsetY == offset.Y && _cfg.Docked == docked) return;
       var cfg = Config.Load(); // 只在位置变化时重读，保留运行期间手改的账户配置
-      cfg.X = x; cfg.Y = y; cfg.Docked = docked;
-      if (cfg.Save()) { _cfg.X = x; _cfg.Y = y; _cfg.Docked = docked; }
+      cfg.Monitor = screen.DeviceName; cfg.OffsetX = offset.X; cfg.OffsetY = offset.Y; cfg.Docked = docked;
+      if (cfg.Save())
+      {
+        _cfg.Monitor = cfg.Monitor; _cfg.OffsetX = offset.X; _cfg.OffsetY = offset.Y; _cfg.Docked = docked;
+      }
     }
 
     // 吸附模式核心: 鼠标感应 + 缓出滑动动画
@@ -1296,7 +1459,7 @@ namespace Milkman
       {
         expanded = false; // 检测到离开即开始收起，无额外等待
       }
-      int target = expanded ? monRect.Top : monRect.Top - _formH + Peek;
+      int target = expanded ? monRect.Top : CollapsedTop;
       if (wr.Top != target)
       {
         int dy = target - wr.Top;
@@ -1321,7 +1484,68 @@ namespace Milkman
     }
 
     // ---------------- 自绘 ----------------
-    float Wd(Graphics g, string s, Font f) { return g.MeasureString(s, f).Width; }
+    // 文字按物理像素绘制并绕开画布缩放：字形由 GDI+ 按最终尺寸微调，不会被压缩变换破坏。
+    // 坐标与测量仍以设计单位表达，进出这里时换算一次。
+    // 中英文分用两款字体：拉丁字符走 LatinFace，其余（中文、符号）走 CjkFace。
+    // 判定该字符交给拉丁字体渲染：ASCII 可见字符与常见排版符号。
+    // 中文、全角标点、⚠/∞ 之类由微软雅黑承担，避免拉丁字体缺字时回退到别的字形。
+    static bool IsLatin(char c)
+    {
+      if (c >= 'A' && c <= 'Z') return true;
+      if (c >= 'a' && c <= 'z') return true;
+      if (c >= '0' && c <= '9') return true;
+      return c == ' ' || c == '%' || c == '.' || c == ',' || c == ':'
+        || c == '-' || c == '+' || c == '/' || c == '(' || c == ')';
+    }
+
+    // pick: 中文那一款（同为 Bold/Regular/字号），拉丁段自动换用对应拉丁字体
+    Font LatinOf(Font cjk)
+    {
+      if (cjk == fontBig) return latinBig;
+      if (cjk == fontMid) return latinMid;
+      return latinTick;
+    }
+
+    // 逐段混排：返回整串宽度
+    float MixedWidth(Graphics g, string s, Font cjk)
+    {
+      if (string.IsNullOrEmpty(s)) return 0;
+      Font latin = LatinOf(cjk);
+      float w = 0;
+      int i = 0;
+      while (i < s.Length)
+      {
+        bool lat = IsLatin(s[i]);
+        int j = i;
+        while (j < s.Length && IsLatin(s[j]) == lat) j++;
+        w += g.MeasureString(s.Substring(i, j - i), lat ? latin : cjk).Width;
+        i = j;
+      }
+      return w;
+    }
+
+    float Wd(Graphics g, string s, Font f) { return MixedWidth(g, s, f) / _scale; }
+
+    void DrawText(Graphics g, string s, Font cjk, Brush b, float x, float y)
+    {
+      if (string.IsNullOrEmpty(s)) return;
+      Matrix m = g.Transform;
+      g.ResetTransform();
+      Font latin = LatinOf(cjk);
+      float px = x * _scale, py = y * _scale;
+      int i = 0;
+      while (i < s.Length)
+      {
+        bool lat = IsLatin(s[i]);
+        int j = i;
+        while (j < s.Length && IsLatin(s[j]) == lat) j++;
+        string part = s.Substring(i, j - i);
+        g.DrawString(part, lat ? latin : cjk, b, px, py);
+        px += g.MeasureString(part, lat ? latin : cjk).Width;
+        i = j;
+      }
+      g.Transform = m;
+    }
 
     // 版式完全参照 DeepSeekTimeline: 顶部 provider 名, 中部圆角色带(独立圆角条/留间隙),
     // 每条下方 两行元信息: 百分比 + 重置时间
@@ -1375,15 +1599,15 @@ namespace Milkman
       return lastSuccess == default(DateTime) ? "" : "更新于 " + lastSuccess.ToString("HH:mm:ss");
     }
 
-    // 按像素宽度截断，超出时以省略号收尾
-    static string Fit(Graphics g, string text, Font font, float max)
+    // 按宽度截断：测量走混排口径，与传入的 max 同一设计单位
+    string Fit(Graphics g, string text, Font font, float max)
     {
-      if (g.MeasureString(text, font).Width <= max) return text;
+      if (MixedWidth(g, text, font) <= max * _scale) return text;
       int low = 0, high = text.Length;
       while (low < high)
       {
         int mid = (low + high + 1) / 2;
-        if (g.MeasureString(text.Substring(0, mid) + "…", font).Width <= max) low = mid;
+        if (MixedWidth(g, text.Substring(0, mid) + "…", font) <= max * _scale) low = mid;
         else high = mid - 1;
       }
       return text.Substring(0, low) + "…";
@@ -1396,7 +1620,7 @@ namespace Milkman
       string title = row.Title, action = _refresh.ActionText(row);
       string status = SourceStatus(busy, row.Result.Error, row.Result.LastSuccess);
       g.FillEllipse(row.Dot, 22, rowY + 7, 9, 9);
-      g.DrawString(title, fontBig, BrText, 40, rowY - 1);
+      DrawText(g, title, fontBig, BrText, 40, rowY - 1);
       if (!string.IsNullOrEmpty(status))
       {
         SolidBrush brush = error && !busy ? BrRed : busy ? BrSub : BrFaint;
@@ -1404,7 +1628,7 @@ namespace Milkman
         float room = right - 40 - Wd(g, title, fontBig) - 8;
         // 放不下的错误长文退回落款，完整原因由空数据行承担，避免标题行出现半截文字
         if (error && !busy && Wd(g, status, fontMid) > room) status = "无法获取信息";
-        g.DrawString(status, fontMid, brush, right - Wd(g, status, fontMid), rowY + 3);
+        DrawText(g, status, fontMid, brush, right - Wd(g, status, fontMid), rowY + 3);
       }
       if (action != null)
       {
@@ -1415,7 +1639,7 @@ namespace Milkman
           g.FillPath(hot ? BrAccent : BrTrack, p);
           g.DrawPath(hot ? PenCloseHot : PenBarBorder, p);
         }
-        g.DrawString(action, fontMid, hot ? BrBg : BrText,
+        DrawText(g, action, fontMid, hot ? BrBg : BrText,
           r.Left + (r.Width - Wd(g, action, fontMid)) / 2f, r.Top + 3);
       }
     }
@@ -1437,9 +1661,9 @@ namespace Milkman
     // 条下元信息: 左端窗口百分比, 右端重置时间(两端对齐, 同小字号)
     void DrawBandMeta(Graphics g, float x, float w, float y, string left, string right)
     {
-      g.DrawString(left, fontTick, BrText, x, y + 2);
+      DrawText(g, left, fontTick, BrText, x, y + 2);
       if (right.Length > 0)
-        g.DrawString(right, fontTick, BrSub, x + w - Wd(g, right, fontTick), y + 2);
+        DrawText(g, right, fontTick, BrSub, x + w - Wd(g, right, fontTick), y + 2);
     }
 
     void DrawWindows(Graphics g, IList<UsageWindow> windows, GraphicsPath[] paths, float bandY, string error)
@@ -1458,10 +1682,10 @@ namespace Milkman
               : window.NotStarted ? "未开始"
               : window.ResetMs > 0 ? "重置 " + FormatRemaining(window.ResetMs) : "");
         else if (error == null)
-          g.DrawString("—", fontTick, BrSub, x, bandY + BandH + 8);
+          DrawText(g, "—", fontTick, BrSub, x, bandY + BandH + 8);
         else
           // 首段显示具体原因，其余段保持占位文案
-          g.DrawString(i == 0 ? "⚠ " + Fit(g, error, fontTick, width - 10) : "⚠ 无数据", fontTick, BrRed,
+          DrawText(g, i == 0 ? "⚠ " + Fit(g, error, fontTick, width - 10) : "⚠ 无数据", fontTick, BrRed,
             x, bandY + BandH + 8);
       }
     }
@@ -1471,8 +1695,10 @@ namespace Milkman
       base.OnPaint(e);
       var g = e.Graphics;
       g.SmoothingMode = SmoothingMode.AntiAlias;
-      g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAlias;
+      // 浮窗透明度与浅色底会让灰度抗锯齿显得发虚；ClearType 在像素网格上渲染，小字号更扎实。
+      g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
       g.Clear(Bg);
+      g.ScaleTransform(_scale, _scale); // 版面按 96 DPI 设计单位绘制，由这里统一放大
 
       foreach (var row in _refresh.Rows)
       {
@@ -1488,7 +1714,7 @@ namespace Milkman
       g.DrawLine(cp, closeRect.Right - 3, closeRect.Top + 4, closeRect.Left + 3, closeRect.Bottom - 3);
 
       // ---- 细边框 ----
-      g.DrawRectangle(PenBorder, 0.5f, 0.5f, W - 1f, ClientSize.Height - 1f);
+      g.DrawRectangle(PenBorder, 0.5f, 0.5f, W - 1f, _designH - 1f);
     }
 
     static SolidBrush StatusBrush(double frac)

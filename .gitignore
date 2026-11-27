@@ -2,3 +2,6 @@
 *.exe
 bin/
 obj/
+
+# 本地 agent 工作目录：skill 定义与临时截图/探针产物都不属于仓库内容
+.dsh/

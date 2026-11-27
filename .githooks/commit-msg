@@ -1,0 +1,5 @@
+#!/bin/sh
+# 本仓库启用了自己的 hooksPath，因此沿用全局 hook 的行为：
+# 移除自动附加的 AI 署名行。
+sed -i.bak '/^Co-Authored-By:.*<noreply@anthropic.com>/d' "$1"
+rm -f "$1.bak"
