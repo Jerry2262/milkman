@@ -43,7 +43,7 @@ powershell.exe -NoProfile -Command 'Start-Process "$env:LOCALAPPDATA\Milkman\Mil
 - `MilkmanForm` — 自绘 UI + 行为（`Form.cs` 与 `Ui.cs` 两个 partial）：
   - 版式是「一个 block = 一个订阅实例」，每个 block 三行：行1 图标+名称+状态+动作按钮，行2 用量条，行3 注脚（百分比 + 重置时间）。**三行左端统一对齐到 `OutlineLeft`（即圆点左边缘）**，右端收到 `RightEdge`；段数 1/2/3 时末段都必须正好落在 `RightEdge`，由 `SegmentIn` 保证并被 `CheckLayout` 守着。高度 = `BlockTop0 + block数 × BlockH(76)`。`OpenCodeAccounts` 留空、`CommandCode` 为 null 都表示未订阅、对应区块隐藏；ChatGPT 按实际窗口数分 1–3 段。Brush/Pen/BandPath 缓存复用，低频动态文本直接测量，禁止缓存不断变化的倒计时字符串。
   - 注脚两段文案不写「重置」前缀：每段可用宽度约 100px（96 DPI），加前缀会让最宽的一组溢出重叠。改为左「5h 14%」右「1h33m」。
-  - 第一行状态只表达「正在做什么」（获取中/刷新中）与「何时更新过」（HH:mm:ss）。**失败原因不在第一行重复**——它由第三行整行显示，第一行只留标题和「重试」按钮，标题因此总有完整宽度。
+  - 第一行状态只表达「正在做什么」（获取中/刷新中）与「何时更新过」（更新于 HH:mm:ss）。**失败原因不在第一行重复**——它由第三行整行显示，第一行只留标题和「重试」按钮，标题因此总有完整宽度。成功与获取中都没有按钮，状态右端可以用到按钮右端（`BtnRight`），最宽的「Command Code · A」+「更新于 HH:mm:ss」实测 400.6 设计单位，可用 433，放得下；有按钮时状态为空，不与之争宽。
   - 吸附：`WM_NCHITTEST`→`HTCAPTION` 系统级拖动；`WM_ENTERSIZEMOVE/EXITSIZEMOVE` 判定出入吸附（Top≤monTop+8 吸附，>monTop+30 脱离）；静止时 `DockTick` 每 100ms 采样，滑动用 30ms 缓出（dy/3，`Peek=5`）；双击 Pin 后立即展开并停止 DockTimer，取消 Pin 时恢复
   - 独立刷新：每个 `SourceRow` 维护自己的 busy/auto/error/last-success，共用 `_refreshTimer`、后台派发、绘制和点击命中逻辑。每次启动等待一次「获取用量」；点击后为 HTTPS 启用 TLS 1.2，并发加载所有已配置来源，成功的来源进入定时刷新；失败只暂停自身并保留旧数据，单击该行「重试」恢复。
   - 置顶：`TopMost = true` 只让 WinForms 在**创建之后**用 `SetWindowPos` 补设一层，而后台启动（开机自启、被别的进程拉起）时这个调用会被系统的 z-order 前台锁静默忽略——窗口就永远不置顶，表现为"有时置顶有时不置顶"。所以 `CreateParams` 里直接带 `WS_EX_TOPMOST`，窗口创建即置顶，与是否前台无关；`EnsureTopMost()` 再在 `WM_WINDOWPOSCHANGED` / `WM_STYLECHANGED(GWL_EXSTYLE)` 与 `OnShown` 后补一次丢失的标志（不轮询、不抢焦点）

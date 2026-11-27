@@ -156,11 +156,12 @@ namespace Milkman
     // 只负责取值与文案，不参与任何坐标计算。
     // 第一行只表达「正在做什么」和「何时更新过」。
     // 失败原因由第三行整行承担，这里返回空，避免同一信息在标题行再占宽度。
+    // 成功/获取中都没有按钮，状态右端可以用到按钮右端，因此「更新于 HH:mm:ss」放得下。
     string SourceStatus(bool busy, string error, DateTime lastSuccess)
     {
       if (error != null && !busy) return "";
       if (busy) return lastSuccess == default(DateTime) ? "获取中" : "刷新中";
-      return lastSuccess == default(DateTime) ? "" : lastSuccess.ToString("HH:mm:ss");
+      return lastSuccess == default(DateTime) ? "" : "更新于 " + lastSuccess.ToString("HH:mm:ss");
     }
 
     // 一条用量条的左右两段文案
